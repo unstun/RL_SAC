@@ -2331,6 +2331,149 @@ def train_one(
     return agent, returns, eval_history, {"meta": train_meta, "train_progress": list(train_progress_history)}
 
 
+# ---------------------------------------------------------------------------
+# SAC training loop (separate from DQN family)
+# ---------------------------------------------------------------------------
+
+def train_one_sac(
+    env: AMRBicycleEnv,
+    *,
+    episodes: int,
+    seed: int,
+    out_dir: Path,
+    sac_cfg_dict: dict,
+    global_map_size: int = 48,
+    learning_starts: int = 500,
+    forest_random_start_goal: bool = True,
+    forest_rand_min_dist_m: float = 6.0,
+    forest_rand_max_dist_m: float | None = None,
+    forest_rand_fixed_prob: float = 0.1,
+    forest_rand_tries: int = 200,
+    forest_rand_edge_margin_m: float = 3.0,
+    forest_curriculum: bool = True,
+    curriculum_band_m: float = 4.0,
+    forest_train_two_suites: bool = True,
+    forest_train_short_prob: float = 0.35,
+    forest_train_short_min_dist_m: float = 6.0,
+    forest_train_short_max_dist_m: float | None = 14.0,
+    forest_train_long_min_dist_m: float = 14.0,
+    forest_train_long_max_dist_m: float | None = None,
+    bc_pretrain_steps: int = 0,
+    progress: bool = True,
+    device: torch.device = torch.device("cpu"),
+) -> tuple[object, np.ndarray, list, dict]:
+    """Simplified SAC training loop for continuous-action forest navigation."""
+    from forest_vehicle_dqn.sac_agent import SACAgent, SACConfig
+
+    progress_write = make_progress_writer(progress)
+
+    def log(msg: str) -> None:
+        if progress_write is not None:
+            progress_write(str(msg))
+
+    sac_config = SACConfig(
+        map_size=int(global_map_size),
+        map_channels=int(sac_cfg_dict.get("global_map_channels", 3)),
+        scalar_dim=12,
+        action_dim=2,
+        hidden_dim=int(sac_cfg_dict.get("sac_hidden_dim", 256)),
+        gamma=float(sac_cfg_dict.get("gamma", 0.99)),
+        tau=float(sac_cfg_dict.get("sac_tau", 0.005)),
+        lr_actor=float(sac_cfg_dict.get("sac_lr_actor", 3e-4)),
+        lr_critic=float(sac_cfg_dict.get("sac_lr_critic", 3e-4)),
+        lr_alpha=float(sac_cfg_dict.get("sac_lr_alpha", 3e-4)),
+        batch_size=int(sac_cfg_dict.get("sac_batch_size", 256)),
+        buffer_size=int(sac_cfg_dict.get("sac_buffer_size", 1_000_000)),
+        target_entropy=float(sac_cfg_dict.get("sac_target_entropy", -2.0)),
+    )
+    agent = SACAgent(sac_config, device=str(device), seed=seed)
+    log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
+
+    returns = np.zeros((episodes,), dtype=np.float32)
+    global_step = 0
+    best_return = float("-inf")
+    best_state = None
+    t_start = time.perf_counter()
+
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(range(episodes), desc="SAC", disable=not progress)
+    except ImportError:
+        pbar = range(episodes)
+
+    for ep in pbar:
+        # Reset with random start/goal
+        reset_options: dict = {}
+        if forest_random_start_goal:
+            min_dist = float(forest_rand_min_dist_m)
+            max_dist = 0.0 if forest_rand_max_dist_m is None else float(forest_rand_max_dist_m)
+            if forest_train_two_suites:
+                rng_suite = np.random.default_rng(seed + ep)
+                if rng_suite.random() < float(forest_train_short_prob):
+                    min_dist = float(forest_train_short_min_dist_m)
+                    max_dist = 0.0 if forest_train_short_max_dist_m is None else float(forest_train_short_max_dist_m)
+                else:
+                    min_dist = float(forest_train_long_min_dist_m)
+                    max_dist = 0.0 if forest_train_long_max_dist_m is None else float(forest_train_long_max_dist_m)
+            reset_options = {
+                "random_start_goal": True,
+                "rand_min_dist_m": min_dist,
+                "rand_max_dist_m": max_dist,
+                "rand_fixed_prob": float(forest_rand_fixed_prob),
+                "rand_tries": int(forest_rand_tries),
+                "rand_edge_margin_m": float(forest_rand_edge_margin_m),
+            }
+
+        obs_raw, _ = env.reset(seed=seed + ep, options=reset_options)
+        obs = env.observe_sac(map_size=global_map_size)
+        done = False
+        truncated = False
+        ep_return = 0.0
+
+        while not (done or truncated):
+            global_step += 1
+            action = agent.act(obs, explore=True)
+            # Map [-1,1] to physical controls
+            delta_dot = float(action[0]) * float(env.model.delta_dot_max_rad_s)
+            accel = float(action[1]) * float(env.model.a_max_m_s2)
+            _, reward, done, truncated, info = env.step_continuous(
+                delta_dot_rad_s=delta_dot, a_m_s2=accel)
+            next_obs = env.observe_sac(map_size=global_map_size)
+            agent.observe(obs, action, float(reward), next_obs, bool(done))
+
+            if global_step >= learning_starts:
+                agent.update()
+
+            obs = next_obs
+            ep_return += float(reward)
+
+        returns[ep] = float(ep_return)
+
+        if ep_return > best_return:
+            best_return = ep_return
+            model_dir = out_dir / "models" / str(env.map_spec.name)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            agent.save(model_dir / "cnn-sac.pt")
+
+        if hasattr(pbar, "set_postfix"):
+            pbar.set_postfix(ret=f"{ep_return:.1f}", best=f"{best_return:.1f}",
+                             steps=global_step, alpha=f"{agent.alpha:.3f}")
+
+        if (ep + 1) % max(1, episodes // 20) == 0 or ep == 0 or ep == episodes - 1:
+            elapsed = time.perf_counter() - t_start
+            log(f"[train-sac] ep={ep+1}/{episodes}, ret={ep_return:.1f}, "
+                f"best={best_return:.1f}, alpha={agent.alpha:.3f}, "
+                f"elapsed={elapsed:.0f}s")
+
+    # Final save
+    model_dir = out_dir / "models" / str(env.map_spec.name)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    agent.save(model_dir / "cnn-sac.pt")
+    log(f"[train-sac] Done: {episodes} episodes, best_return={best_return:.1f}")
+
+    return agent, returns, [], {"meta": {"algo": "cnn-sac", "episodes": episodes}}
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Train RL agents (default: DQN) and generate Fig. 13-style reward curves.")
     ap.add_argument(
@@ -3294,14 +3437,18 @@ def main(argv: list[str] | None = None) -> int:
     if bool(getattr(args, "forest_no_fallback", False)):
         args.forest_action_shield = False
         args.forest_expert_exploration = False
-    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn")
+    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-sac")
     raw_algos = [str(a).lower().strip() for a in (args.rl_algos or [])]
     if any(a == "all" for a in raw_algos):
-        raw_algos = list(canonical_all)
+        raw_algos = list(canonical_all[:-1])  # exclude cnn-sac from "all"
 
     rl_algos: list[str] = []
     unknown = []
     for a in raw_algos:
+        if a == "cnn-sac":
+            if "cnn-sac" not in rl_algos:
+                rl_algos.append("cnn-sac")
+            continue
         try:
             canonical, _arch, _base, _legacy = parse_rl_algo(a)
         except ValueError:
@@ -3469,6 +3616,7 @@ def main(argv: list[str] | None = None) -> int:
         "cnn-dqn": "CNN-DQN",
         "cnn-ddqn": "CNN-DDQN",
         "cnn-pddqn": "CNN-PDDQN",
+        "cnn-sac": "CNN-SAC",
     }
 
     for env_name in args.envs:
@@ -3489,6 +3637,9 @@ def main(argv: list[str] | None = None) -> int:
                 goal_stop_delta_deg=float(args.goal_stop_delta_deg),
                 reward_k_t=float(args.forest_reward_k_t),
                 reward_k_delta=float(args.forest_reward_k_delta),
+                reward_k_p=float(getattr(args, "forest_reward_k_p", 12.0)),
+                reward_k_kappa=float(getattr(args, "forest_reward_k_kappa", 0.2)),
+                reward_k_len=float(getattr(args, "forest_reward_k_len", 0.0)),
                 reward_no_progress_penalty=float(args.forest_reward_no_progress_penalty),
                 reward_no_progress_eps_m=float(args.forest_reward_no_progress_eps_m),
                 reward_idle_speed_m_s=float(args.forest_reward_idle_speed_m_s),
@@ -3566,6 +3717,60 @@ def main(argv: list[str] | None = None) -> int:
         for algo in args.rl_algos:
             t_algo_start = time.perf_counter()
             log(f"[train] Algo start: env={env_name}, algo={str(algo)}")
+
+            # --- SAC branch ---
+            if str(algo) == "cnn-sac":
+                if not isinstance(env, AMRBicycleEnv):
+                    print(f"cnn-sac requires AMRBicycleEnv (forest env), got {type(env).__name__}", file=sys.stderr)
+                    return 2
+                sac_cfg_raw = {}
+                if config_path is not None:
+                    sac_cfg_raw = select_section(load_json(Path(config_path)), section="train")
+                try:
+                    _, algo_returns, algo_eval, algo_extra = train_one_sac(
+                        env,
+                        episodes=args.episodes,
+                        seed=args.seed + 1000,
+                        out_dir=out_dir,
+                        sac_cfg_dict=sac_cfg_raw,
+                        global_map_size=int(getattr(args, "global_map_size", 48)),
+                        learning_starts=int(args.learning_starts),
+                        forest_random_start_goal=bool(args.forest_random_start_goal),
+                        forest_rand_min_dist_m=float(args.forest_rand_min_dist_m),
+                        forest_rand_max_dist_m=rand_max,
+                        forest_rand_fixed_prob=float(args.forest_rand_fixed_prob),
+                        forest_rand_tries=int(args.forest_rand_tries),
+                        forest_rand_edge_margin_m=float(args.forest_rand_edge_margin_m),
+                        forest_curriculum=bool(args.forest_curriculum),
+                        forest_train_two_suites=bool(getattr(args, "forest_train_two_suites", False)),
+                        forest_train_short_prob=float(getattr(args, "forest_train_short_prob", 0.35)),
+                        forest_train_short_min_dist_m=float(getattr(args, "forest_train_short_min_dist_m", 6.0)),
+                        forest_train_short_max_dist_m=(
+                            None if float(getattr(args, "forest_train_short_max_dist_m", 14.0)) <= 0.0
+                            else float(getattr(args, "forest_train_short_max_dist_m", 14.0))
+                        ),
+                        forest_train_long_min_dist_m=float(getattr(args, "forest_train_long_min_dist_m", 42.0)),
+                        forest_train_long_max_dist_m=(
+                            None if float(getattr(args, "forest_train_long_max_dist_m", 0.0)) <= 0.0
+                            else float(getattr(args, "forest_train_long_max_dist_m", 0.0))
+                        ),
+                        bc_pretrain_steps=int(getattr(args, "sac_bc_pretrain_steps",
+                                                      sac_cfg_raw.get("sac_bc_pretrain_steps", 0))),
+                        progress=progress,
+                        device=device,
+                    )
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    return 2
+                env_curves[str(algo)] = algo_returns
+                env_eval_rows[str(algo)] = list(algo_eval)
+                env_train_meta[str(algo)] = algo_extra.get("meta", {})
+                log(f"[train] Algo done: env={env_name}, algo={str(algo)}, "
+                    f"elapsed={format_elapsed_s(time.perf_counter() - t_algo_start)}")
+                continue
+
+            # --- DQN family branch ---
             cfg = algo_cfgs[str(algo)]
             live_viewer = None
             if bool(getattr(args, "live_view", False)):
