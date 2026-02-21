@@ -92,3 +92,29 @@ class SACCritic(nn.Module):
         h = self.encoder(maps, scalars)
         ha = torch.cat([h, actions], dim=1)
         return self.q1(ha), self.q2(ha)
+
+
+class SACEntropyCritic(nn.Module):
+    """Twin Q-networks for cumulative entropy estimation (TECRL)."""
+
+    def __init__(self, encoder: GlobalCNNEncoder, action_dim: int = 2,
+                 hidden_dim: int = 256):
+        super().__init__()
+        self.encoder = encoder
+        feat = encoder.feature_dim + action_dim
+        self.q1 = nn.Sequential(
+            nn.Linear(feat, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.q2 = nn.Sequential(
+            nn.Linear(feat, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, maps: torch.Tensor, scalars: torch.Tensor,
+                actions: torch.Tensor):
+        h = self.encoder(maps, scalars)
+        ha = torch.cat([h, actions], dim=1)
+        return self.q1(ha), self.q2(ha)

@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from forest_vehicle_dqn.sac_networks import (
-    GlobalCNNEncoder, SACActor, SACCritic,
+    GlobalCNNEncoder, SACActor, SACCritic, SACEntropyCritic,
 )
 
 
