@@ -11,3 +11,5 @@
 
 1. **smoke-train-20260221_160435**: 150 episodes, ubuntu-zt (RTX 5070 Ti), ~8m29s
 2. **smoke-infer-20260221_161349**: runs=3, short/mid/long, success_rate=0% 全套件
+3. **mid3-train-20260221_190531**: 1000 episodes（含 BC pretrain 5000 steps + reward_scale=0.01 + grad_clip=1.0），ubuntu-zt, ~1h32m，训练发散
+4. **mid3-infer-20260221_203908**: runs=3, short/mid/long, success_rate=0% 全套件
