@@ -1,4 +1,4 @@
-# dqn (forest vehicle planning + tracking)
+# RL_sac (forest vehicle planning + tracking)
 
 English | [简体中文](README.zh-CN.md)
 
@@ -7,12 +7,60 @@ This repo focuses on a forest-scene kinematic vehicle (Ackermann/bicycle) enviro
 
 Default conda environment: `ros2py310`.
 
+## Repository migration note (2026-02-21)
+
+- New GitHub repository: `git@github.com:unstun/RL_SAC.git`
+- Historical stable baseline remains `v7p1` (`CNN-DDQN`) for rollback/comparison.
+- SAC migration target is `v8` (`SAC-GlobalCNN`), with design/plan in:
+  - `docs/plans/2026-02-20-sac-globalcnn-design.md`
+  - `docs/plans/2026-02-20-sac-globalcnn-plan.md`
+- This round updates documentation/repo routing only; no core train/infer algorithm code is changed.
+
+## AI TL;DR (contract, 2026-02-21)
+
+```text
+STABLE_PROFILE=v7p1 (historical DQN baseline)
+TRANSITION_TARGET=v8 (SAC-GlobalCNN)
+CLAIM_REGIME=shielded/hybrid (v7p1 baseline)
+SMOKE_GATE=train episodes=150; infer runs=3 (screening only; no final claims)
+FINAL_GATE=short runs=20 + long runs=20; pass iff:
+  - success_rate(SAC-GlobalCNN) >= success_rate(Hybrid A*-MPC)
+  - avg_path_length(SAC-GlobalCNN) < avg_path_length(Hybrid A*-MPC)
+  - path_time_s(SAC-GlobalCNN) < path_time_s(Hybrid A*-MPC)
+REPORT_ARTIFACTS:
+  - table2_kpis_mean_raw.csv (mean KPIs; use for gates/tables)
+  - table2_kpis_raw.csv (per-run/per-pair diagnostics; includes failure_reason)
+```
+
+## Stages (terminology)
+
+- `self-check`: imports/device sanity check.
+- `micro-smoke`: optional ultra-fast loop (e.g. `episodes=40`) for sanity only; not comparable.
+- `smoke`: standard screening gate (`episodes=150`, `runs=3`); go/no-go only.
+- `full`: final gate (short/long suites with `runs=20` each).
+
+## Repo map (configs + runs)
+
+- Config selection index: `configs/INDEX.md`
+- Config usage details: `configs/README.md`
+- Run artifact map: `docs/runs/README.md`
+- Candidate cleanup list: `docs/runs/CANDIDATES_TO_ARCHIVE_20260221.md`
+
+## Research objective and current status (2026-02-21)
+
+- This repo is under active `vibe coding` iteration: small deltas, quick validation loops, and strict rollback/archive discipline.
+- Current stable rollback baseline is `v7p1` (`configs/v7p1.json`).
+- SAC migration target version is `v8` (`SAC-GlobalCNN`), currently in planning/implementation stage.
+- `v7p2` and `v7p2p1` are archived failed attempts (Markov-observation fix branch), and are not the current mainline claim baseline.
+- Final objective: make RL planning (`SAC-GlobalCNN`) outperform classical planning (`Hybrid A*-MPC`) under fair and reproducible evaluation.
+- Core optimization targets: shorter paths (`avg_path_length`), shorter path time (`path_time_s`), and smoother trajectories (`avg_curvature_1_m`, lower is better).
+
 ## Quickstart (Ubuntu/bash)
 
-All commands below assume you run from the `dqn/` folder so outputs go to `runs/` by default:
+All commands below assume you run from the `RL_sac/` folder so outputs go to `runs/` by default:
 
 ```bash
-cd /home/sun/phdproject/dqn/dqn
+cd /home/sun/phdproject/dqn/RL_sac
 ```
 
 Two ways to run commands:
@@ -49,10 +97,11 @@ conda run -n ros2py310 python -m pip install -r requirements-optional.txt
 
 Old checkpoints/configs with the previous forest observation/flag schema are not backward compatible.
 
-## Version note (2026-02-20)
+## Version note (2026-02-21)
 
+- As of 2026-02-21, the stable mainline remains `v7p1`.
 - `v7p2/v7p2p1` attempted a Markov-observation fix (adding `prev_a_n`) but did not show stable gains and was archived as a failed branch.
-- Mainline has been rolled back to `v7p1` behavior (forest bicycle observation `10 + N*N`) for continued iteration.
+- Mainline was rolled back to `v7p1` behavior (forest bicycle observation `10 + N*N`) for continued iteration.
 - Failure archive: `docs/versions/v7p2p1/`.
 
 ## Train / infer (recommended: config profiles)
@@ -73,7 +122,7 @@ python infer.py --profile forest_a_all6_300_cuda
 
 ### Latest train/infer commands (keep updated)
 
-Last updated: 2026-02-20  
+Last updated: 2026-02-21  
 Current recommended train profile: `v7p1`
 
 ```bash
@@ -83,9 +132,10 @@ conda run -n ros2py310 python infer.py --profile v7p1
 
 Note: training now saves process logs to `<run_dir>/train_flow.log` by default; disable via `--no-save-train-log`.
 
-Primary claim regime (docs/paper, current mainline): `CNN-DDQN (shielded/hybrid inference)`.
+Primary claim regime (docs/paper, current executable baseline): `CNN-DDQN (shielded/hybrid inference)`.
 - For v6p2p3/v7p1 and onward mainline reporting, use `shielded/hybrid` naming.
 - Do not present these mainline results as `strict-argmax`.
+- SAC (`v8`) claim regime will be updated after SAC train/infer pipeline is merged.
 
 ### Remote-first execution (`ubuntu-zt`)
 
@@ -99,19 +149,19 @@ rsync -avz --delete \
   --exclude 'runs/' \
   --exclude '__pycache__/' \
   --exclude '*.pyc' \
-  /home/sun/phdproject/dqn/dqn/ \
-  ubuntu-zt:/home/sun/phdproject/dqn/dqn/
+  /home/sun/phdproject/dqn/RL_sac/ \
+  ubuntu-zt:/home/sun/phdproject/dqn/RL_sac/
 
-# 2) Run on remote (example: smoke train)
-ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --profile v6p2p3 --episodes 40 --out v6p2p3_smoke --device cuda --progress"
+# 2) Run on remote (example: smoke train / micro-smoke, episodes=40; sanity only)
+ssh ubuntu-zt "cd /home/sun/phdproject/dqn/RL_sac && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --profile v6p2p3 --episodes 40 --out v6p2p3_smoke --device cuda --progress"
 
 # 3) Sync remote results -> local runs/
 rsync -avz \
-  ubuntu-zt:/home/sun/phdproject/dqn/dqn/runs/v6p2p3_smoke/ \
-  /home/sun/phdproject/dqn/dqn/runs/v6p2p3_smoke/
+  ubuntu-zt:/home/sun/phdproject/dqn/RL_sac/runs/v6p2p3_smoke/ \
+  /home/sun/phdproject/dqn/RL_sac/runs/v6p2p3_smoke/
 ```
 
-Quick smoke (same settings, fewer episodes):
+Micro-smoke (optional quick loop; not the standard smoke gate):
 
 ```bash
 conda run -n ros2py310 python train.py --profile v6p2p3 --episodes 40 --out v6p2p3_smoke
@@ -158,9 +208,49 @@ conda run -n ros2py310 python game.py --profile repro_20260212_interactive_game_
 Planner hotkeys: `1`=hybrid A*, `2`=RRT*, `3`=grid A*, `4`=cnn-ddqn (requires `--rl-checkpoint <path>`).  
 Other: `R` reset, `SPACE` pause, `P` replan.
 
+## `runs/` layout and report artifacts
+
+Output routing:
+- If `--out <name>` is a bare name, outputs go to `runs/<name>/`.
+- If `--out <path>` is a path, outputs go to `<path>/` as-is.
+
+Typical structure (train + nested infer):
+
+```text
+runs/<out>/
+  latest.txt
+  train_YYYYMMDD_HHMMSS/
+    configs/run.json
+    train_flow.log
+    models/
+    infer/
+      latest.txt
+      YYYYMMDD_HHMMSS/
+        configs/run.json
+        table2_kpis_mean_raw.csv
+        table2_kpis_raw.csv
+```
+
+Notes:
+- For scripts/machines, prefer `*_raw.csv` files. The non-raw `table2_kpis_mean.csv` uses human-friendly column names.
+- Final gates/tables should read `table2_kpis_mean_raw.csv`; failure distribution/diagnostics should read `table2_kpis_raw.csv`.
+
+### KPI dictionary (`table2_kpis_*` columns, minimal)
+
+- `success_rate`: success ratio in `[0,1]` (higher is better).
+- `avg_path_length`: average planned path length in meters (lower is better).
+- `path_time_s`: trajectory execution time in seconds (lower is better).
+- `avg_curvature_1_m`: average curvature in `1/m` (lower is smoother).
+- `planning_time_s`: planner time in seconds (lower is better).
+- `tracking_time_s`: tracking/controller time in seconds (lower is better).
+- `inference_time_s`: policy inference time in seconds (RL only; lower is better).
+- `argmax_inadmissible_rate`: fraction of steps where `argmax(Q)` is inadmissible (diagnostic).
+- `fallback_rate`: fraction of steps where inference-time fallback/override triggered (diagnostic; should be `0` in `strict-argmax` by definition).
+- `failure_reason`: failure type label (only in `table2_kpis_raw.csv`).
+
 ## 版本总索引（v1 → v7p2p1）
 
-> 说明：本索引用于统一 `docs/versions/` 的重编号口径；历史目录 `v3p1`~`v3p11` 保留原记录，未纳入本轮重编号；早期误混入版本链已于 2026-02-09 清理，当前主线编号延续至 `v7p2p1`。
+> 说明：本索引用于统一 `docs/versions/` 的重编号口径；历史目录 `v3p1`~`v3p11` 保留原记录，未纳入本轮重编号；早期误混入版本链已于 2026-02-09 清理。当前稳定主线为 `v7p1`，`v7p2/v7p2p1` 属于失败归档分支。
 
 | 版本 | 目录 | 主 config | 关键 run | 最佳 SR（CNN short/long） | 基线 SR（Hybrid short/long） | 状态 |
 |---|---|---|---|---|---|---|
@@ -183,11 +273,21 @@ Other: `R` reset, `SPACE` pause, `P` replan.
 | `v6p2` | `docs/versions/v6p2/` | `configs/repro_20260211_v6p1_timeout_tune_hybrid_long_pairs20_v1.json` | `runs/repro_20260211_v6p1_timeout_tune_hybrid_long_pairs20_v1/20260212_003414` | `0.70 / 0.95` | `0.95 / 0.90` | 未通过 |
 | `v6p2p2` | `docs/versions/v6p2p2/` | `configs/v6p2p2.json` | `runs/repro_20260219_v6p2p2_reward_sweep_kt0p1_kd0p8_infer20/20260219_123433` | `0.75 / 0.55` | `0.95 / 1.00` | 未通过（待 full） |
 | `v6p2p3` | `docs/versions/v6p2p3/` | `configs/v6p2p3.json` | `runs/v6p2p3/train_20260219_142104/infer/20260219_145315` | `0.80 / 1.00` | `1.00 / 1.00` | 已运行（runs=5，待 full20） |
-| `v7p2` | `docs/versions/v7p2/` | `configs/v7p2.json` | `runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137` | `1.00 / 1.00` | `1.00 / 1.00` | 已运行（smoke：episodes=40, runs=3） |
+| `v7p1` | `docs/versions/v7p1/` | `configs/v7p1.json` | `runs/v7p1_train300_esbest/train_20260221_010743/infer/20260221_011927` | `1.00 / 1.00` | `1.00 / 1.00` | 稳定主线（runs=5，待 full20） |
+| `v7p2` | `docs/versions/v7p2/` | `configs/v7p2.json` | `runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137` | `1.00 / 1.00` | `1.00 / 1.00` | 已运行（micro-smoke：episodes=40, runs=3） |
 | `v7p2p1` | `docs/versions/v7p2p1/` | `configs/repro_20260220_v7p2p1_rollback_v7p1.json` | `runs/v7p2_es150/train_20260220_222056/infer/20260220_223016` | `0.85 / 0.65` | `0.95 / 1.00` | 失败归档，已回退到 `v7p1` |
 
 - baseline-only（`--skip-rl`）输出不计入上表；请单独查看 `runs/outputs_forest_baselines/*`、`runs/repro_20260207_*` 等目录。
 - 详细四件套请见 `docs/versions/README.md` 与各版本目录。
+
+## Rigour and anti-cheating rules (mandatory)
+
+- RL vs baseline comparison must use the same environment/suite and fixed start-goal pairs (no sample drift).
+- Claiming gains requires matched evaluation budget and protocol; final claims must use short/long suites with `runs=20` each.
+- Smoke results (`episodes=150`, `runs=3`) are screening-only and cannot be used as final claims.
+- Inference policy naming must match implementation (`strict-argmax` vs `shielded/masked/hybrid`), with no hidden intervention.
+- No cherry-picking: failed versions/runs must be archived, and missing outputs must be reported as `N/A` with reasons.
+- Every claim must be traceable to artifacts: command line, `run_dir`, `run.json`, and `table2_kpis_mean_raw.csv`.
 
 ## Recommended iteration workflow (version-first)
 
@@ -227,6 +327,8 @@ Use `table2_kpis_mean_raw.csv` and compare `CNN-DDQN` against `Hybrid A*-MPC` wi
 - `success_rate(CNN-DDQN) >= success_rate(Hybrid A*-MPC)`
 - `avg_path_length(CNN-DDQN) < avg_path_length(Hybrid A*-MPC)`
 - `path_time_s(CNN-DDQN) < path_time_s(Hybrid A*-MPC)`
+
+Also report smoothness in the same table via `avg_curvature_1_m` (lower is smoother). This is a mandatory reporting metric and optimization target for version selection.
 
 If any suite fails any condition above, the final gate is considered failed.
 

@@ -1,4 +1,4 @@
-# dqn（森林场景车辆规划 + 跟踪）
+# RL_sac（森林场景车辆规划 + 跟踪）
 
 [English](README.md) | 简体中文
 
@@ -6,12 +6,60 @@
 
 默认 conda 环境：`ros2py310`。
 
+## 仓库迁移说明（2026-02-21）
+
+- 新 GitHub 仓库：`git@github.com:unstun/RL_SAC.git`
+- 历史稳定回退基线仍为 `v7p1`（`CNN-DDQN`）。
+- SAC 迁移目标版本为 `v8`（`SAC-GlobalCNN`），方案文档：
+  - `docs/plans/2026-02-20-sac-globalcnn-design.md`
+  - `docs/plans/2026-02-20-sac-globalcnn-plan.md`
+- 本轮仅做文档与仓库路由迁移，不修改训练/推理核心算法代码。
+
+## AI TL;DR（合同块，2026-02-21）
+
+```text
+STABLE_PROFILE=v7p1（历史 DQN 基线）
+TRANSITION_TARGET=v8（SAC-GlobalCNN）
+CLAIM_REGIME=shielded/hybrid（当前 v7p1 基线口径）
+SMOKE_GATE=train episodes=150; infer runs=3 (screening only; no final claims)
+FINAL_GATE=short runs=20 + long runs=20; pass iff:
+  - success_rate(SAC-GlobalCNN) >= success_rate(Hybrid A*-MPC)
+  - avg_path_length(SAC-GlobalCNN) < avg_path_length(Hybrid A*-MPC)
+  - path_time_s(SAC-GlobalCNN) < path_time_s(Hybrid A*-MPC)
+REPORT_ARTIFACTS:
+  - table2_kpis_mean_raw.csv (mean KPIs; use for gates/tables)
+  - table2_kpis_raw.csv (per-run/per-pair diagnostics; includes failure_reason)
+```
+
+## 术语（Stages）
+
+- `self-check`：导入/设备的快速自检。
+- `micro-smoke`：可选超快速回路（例如 `episodes=40`），只做 sanity；不具备可比性。
+- `smoke`：标准筛查门（`episodes=150`、`runs=3`），仅用于 go/no-go。
+- `full`：最终门（short/long 双套件，各 `runs=20`）。
+
+## 仓库导航（configs + runs）
+
+- 配置选型索引：`configs/INDEX.md`
+- 配置使用说明：`configs/README.md`
+- 运行产物总览：`docs/runs/README.md`
+- 归档候选清单：`docs/runs/CANDIDATES_TO_ARCHIVE_20260221.md`
+
+## 研究目标与当前状态（2026-02-21）
+
+- 本仓库正在采用 `vibe coding` 持续迭代：小步改动、快速验证、严格回退与归档。
+- 当前稳定回退基线为 `v7p1`（`configs/v7p1.json`）。
+- SAC 迁移目标版本为 `v8`（`SAC-GlobalCNN`），目前处于方案落地阶段。
+- `v7p2` 与 `v7p2p1` 属于 Markov 观测修复尝试分支，已归档为失败版本，不作为当前主线结论口径。
+- 最终目标：在公平、可复现的评测条件下，使 RL 规划器（`SAC-GlobalCNN`）整体超过传统方法（`Hybrid A*-MPC`）。
+- 核心优化方向：路径更短（`avg_path_length` 更小）、时间更短（`path_time_s` 更小）、曲线更平滑（`avg_curvature_1_m` 更小）。
+
 ## 快速开始（Ubuntu/bash）
 
-下面的命令默认你在 `dqn/` 目录下运行，因此输出默认写入 `runs/`：
+下面的命令默认你在 `RL_sac/` 目录下运行，因此输出默认写入 `runs/`：
 
 ```bash
-cd /home/sun/phdproject/dqn/dqn
+cd /home/sun/phdproject/dqn/RL_sac
 ```
 
 命令有两种用法：
@@ -48,10 +96,11 @@ conda run -n ros2py310 python -m pip install -r requirements-optional.txt
 
 旧版观测布局/参数命名下训练出的模型与配置不再兼容。
 
-## 版本说明（2026-02-20）
+## 版本说明（2026-02-21）
 
+- 截至 2026-02-21，当前稳定主线仍为 `v7p1`。
 - `v7p2/v7p2p1` 进行过 Markov 观测修复尝试（加入 `prev_a_n`），但收益不稳定，已归档为失败分支。
-- 主线已回退到 `v7p1` 行为口径（forest bicycle 观测维度恢复为 `10 + N*N`），用于继续迭代。
+- 主线已回退到 `v7p1` 行为口径（forest bicycle 观测维度恢复为 `10 + N*N`），并据此继续迭代。
 - 失败留档见：`docs/versions/v7p2p1/`。
 
 ## 训练 / 推理（推荐：配置 profile）
@@ -72,7 +121,7 @@ python infer.py --profile forest_a_all6_300_cuda
 
 ### 最新训练/推理命令（请持续维护）
 
-最后更新：2026-02-20  
+最后更新：2026-02-21  
 当前推荐训练 profile：`v7p1`
 
 ```bash
@@ -82,9 +131,10 @@ conda run -n ros2py310 python infer.py --profile v7p1
 
 说明：训练默认会将流程日志保存到 `<run_dir>/train_flow.log`；如需关闭可加 `--no-save-train-log`。
 
-主线对外口径（文档/论文）：`CNN-DDQN（shielded/hybrid inference）`。
+当前可执行基线的对外口径（文档/论文）：`CNN-DDQN（shielded/hybrid inference）`。
 - 对 `v6p2p3/v7p1` 及后续主线版本，统一按 `shielded/hybrid` 命名与汇报。
 - 不将这些主线结果表述为 `strict-argmax`。
+- `v8` 的 SAC 口径会在 SAC 训练/推理链路合入后单独更新。
 
 ### 远端优先执行（`ubuntu-zt`）
 
@@ -98,19 +148,19 @@ rsync -avz --delete \
   --exclude 'runs/' \
   --exclude '__pycache__/' \
   --exclude '*.pyc' \
-  /home/sun/phdproject/dqn/dqn/ \
-  ubuntu-zt:/home/sun/phdproject/dqn/dqn/
+  /home/sun/phdproject/dqn/RL_sac/ \
+  ubuntu-zt:/home/sun/phdproject/dqn/RL_sac/
 
-# 2) 远端执行（示例：smoke 训练）
-ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --profile v6p2p3 --episodes 40 --out v6p2p3_smoke --device cuda --progress"
+# 2) 远端执行（示例：micro-smoke 训练，episodes=40；仅 sanity）
+ssh ubuntu-zt "cd /home/sun/phdproject/dqn/RL_sac && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --profile v6p2p3 --episodes 40 --out v6p2p3_smoke --device cuda --progress"
 
 # 3) 远端结果 -> 本地 runs/ 回传
 rsync -avz \
-  ubuntu-zt:/home/sun/phdproject/dqn/dqn/runs/v6p2p3_smoke/ \
-  /home/sun/phdproject/dqn/dqn/runs/v6p2p3_smoke/
+  ubuntu-zt:/home/sun/phdproject/dqn/RL_sac/runs/v6p2p3_smoke/ \
+  /home/sun/phdproject/dqn/RL_sac/runs/v6p2p3_smoke/
 ```
 
-快速 smoke（同配置，降低训练轮数用于先验筛查）：
+micro-smoke（可选超快回路；非标准 smoke 门）：
 
 ```bash
 conda run -n ros2py310 python train.py --profile v6p2p3 --episodes 40 --out v6p2p3_smoke
@@ -157,9 +207,49 @@ conda run -n ros2py310 python game.py --profile repro_20260212_interactive_game_
 规划器快捷键：`1`=hybrid A*，`2`=RRT*，`3`=grid A*，`4`=cnn-ddqn（需要 `--rl-checkpoint <path>`）。  
 其他：`R` 重置，`SPACE` 暂停，`P` 重新规划。
 
+## `runs/` 目录结构与工件定位
+
+输出路径规则：
+- 若 `--out <name>` 为纯名称，则输出写入 `runs/<name>/`。
+- 若 `--out <path>` 为路径，则输出直接写入 `<path>/`。
+
+典型结构（train + 嵌套 infer）：
+
+```text
+runs/<out>/
+  latest.txt
+  train_YYYYMMDD_HHMMSS/
+    configs/run.json
+    train_flow.log
+    models/
+    infer/
+      latest.txt
+      YYYYMMDD_HHMMSS/
+        configs/run.json
+        table2_kpis_mean_raw.csv
+        table2_kpis_raw.csv
+```
+
+说明：
+- 机器/脚本解析优先使用 `*_raw.csv`。非 raw 的 `table2_kpis_mean.csv` 使用更“可读”的列名（不利于稳定解析）。
+- 最终门槛与对比表读取 `table2_kpis_mean_raw.csv`；失败分布与诊断读取 `table2_kpis_raw.csv`。
+
+### KPI 字段字典（`table2_kpis_*` 列，最小必需）
+
+- `success_rate`：成功率，范围 `[0,1]`（越大越好）。
+- `avg_path_length`：平均路径长度（米，越小越好）。
+- `path_time_s`：轨迹执行时间（秒，越小越好）。
+- `avg_curvature_1_m`：平均曲率（`1/m`，越小越平滑）。
+- `planning_time_s`：规划时间（秒，越小越好）。
+- `tracking_time_s`：跟踪/控制时间（秒，越小越好）。
+- `inference_time_s`：策略推理时间（秒，仅 RL；越小越好）。
+- `argmax_inadmissible_rate`：`argmax(Q)` 不可行的比例（诊断指标）。
+- `fallback_rate`：推理期 fallback/override 触发比例（诊断指标；在 `strict-argmax` 口径下理论应为 `0`）。
+- `failure_reason`：失败原因标签（仅在 `table2_kpis_raw.csv` 中提供）。
+
 ## 版本总索引（v1 → v7p2p1）
 
-> 说明：本索引用于统一 `docs/versions/` 的重编号口径；历史目录 `v3p1`~`v3p11` 保留原记录，未纳入本轮重编号；早期误混入版本链已于 2026-02-09 清理，当前主线编号延续至 `v7p2p1`。
+> 说明：本索引用于统一 `docs/versions/` 的重编号口径；历史目录 `v3p1`~`v3p11` 保留原记录，未纳入本轮重编号；早期误混入版本链已于 2026-02-09 清理。当前稳定主线为 `v7p1`，`v7p2/v7p2p1` 属于失败归档分支。
 
 | 版本 | 目录 | 主 config | 关键 run | 最佳 SR（CNN short/long） | 基线 SR（Hybrid short/long） | 状态 |
 |---|---|---|---|---|---|---|
@@ -182,11 +272,21 @@ conda run -n ros2py310 python game.py --profile repro_20260212_interactive_game_
 | `v6p2` | `docs/versions/v6p2/` | `configs/repro_20260211_v6p1_timeout_tune_hybrid_long_pairs20_v1.json` | `runs/repro_20260211_v6p1_timeout_tune_hybrid_long_pairs20_v1/20260212_003414` | `0.70 / 0.95` | `0.95 / 0.90` | 未通过 |
 | `v6p2p2` | `docs/versions/v6p2p2/` | `configs/v6p2p2.json` | `runs/repro_20260219_v6p2p2_reward_sweep_kt0p1_kd0p8_infer20/20260219_123433` | `0.75 / 0.55` | `0.95 / 1.00` | 未通过（待 full） |
 | `v6p2p3` | `docs/versions/v6p2p3/` | `configs/v6p2p3.json` | `runs/v6p2p3/train_20260219_142104/infer/20260219_145315` | `0.80 / 1.00` | `1.00 / 1.00` | 已运行（runs=5，待 full20） |
-| `v7p2` | `docs/versions/v7p2/` | `configs/v7p2.json` | `runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137` | `1.00 / 1.00` | `1.00 / 1.00` | 已运行（smoke：episodes=40, runs=3） |
+| `v7p1` | `docs/versions/v7p1/` | `configs/v7p1.json` | `runs/v7p1_train300_esbest/train_20260221_010743/infer/20260221_011927` | `1.00 / 1.00` | `1.00 / 1.00` | 稳定主线（runs=5，待 full20） |
+| `v7p2` | `docs/versions/v7p2/` | `configs/v7p2.json` | `runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137` | `1.00 / 1.00` | `1.00 / 1.00` | 已运行（micro-smoke：episodes=40, runs=3） |
 | `v7p2p1` | `docs/versions/v7p2p1/` | `configs/repro_20260220_v7p2p1_rollback_v7p1.json` | `runs/v7p2_es150/train_20260220_222056/infer/20260220_223016` | `0.85 / 0.65` | `0.95 / 1.00` | 失败归档，已回退到 `v7p1` |
 
 - baseline-only（`--skip-rl`）输出不计入上表；请单独查看 `runs/outputs_forest_baselines/*`、`runs/repro_20260207_*` 等目录。
 - 详细四件套请见 `docs/versions/README.md` 与各版本目录。
+
+## 严谨性与反作弊规则（强制）
+
+- RL 与基线对比必须使用同一环境、同一套件、同一组固定起终点样本（禁止样本漂移）。
+- 宣称收益时必须保持评测预算与口径一致；最终结论必须使用 short/long 双套件且各 `runs=20`。
+- smoke 结果（`episodes=150`、`runs=3`）仅用于筛查，不得作为最终结论。
+- 推理策略命名必须与实现一致（`strict-argmax` vs `shielded/masked/hybrid`），禁止隐藏干预后仍宣称 strict。
+- 禁止挑结果：失败版本/失败运行必须归档；结果缺失必须写 `N/A` 并说明原因。
+- 任何结论必须可追溯到工件：命令行、`run_dir`、`run.json`、`table2_kpis_mean_raw.csv`。
 
 ## 推荐迭代流程（版本优先）
 
@@ -226,6 +326,8 @@ conda run -n ros2py310 python infer.py --profile <candidate> --models <version>_
 - `success_rate(CNN-DDQN) >= success_rate(Hybrid A*-MPC)`
 - `avg_path_length(CNN-DDQN) < avg_path_length(Hybrid A*-MPC)`
 - `path_time_s(CNN-DDQN) < path_time_s(Hybrid A*-MPC)`
+
+同时必须在同一结果表中报告平滑性指标 `avg_curvature_1_m`（越小越平滑）。该指标是版本筛选与优化方向中的强制汇报项。
 
 任一套件未满足任一条件，即视为未通过最终门槛。
 

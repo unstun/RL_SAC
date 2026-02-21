@@ -12,13 +12,21 @@
 
 > 推荐命令风格：`conda run -n ros2py310 ...`（Ubuntu 24.04）。
 
+## 快速导航（先看这里）
+
+- 主线 profile（当前稳定回退基线）：`configs/v7p1.json`
+- SAC 迁移目标：`v8`（配置待合入，先参考 `docs/plans/2026-02-20-sac-globalcnn-plan.md`）
+- 配置总索引（推荐入口）：`configs/INDEX.md`
+- 版本留档索引：`docs/versions/README.md`
+- 运行结果索引：`docs/runs/README.md`
+
 ---
 
 ## 1) 用 profile 跑训练 / 推理
 
 ```bash
-conda run -n ros2py310 python train.py --profile repro_20260210_forest_a_cnn_ddqn_strict_no_fallback_v4p3p1_smoke300
-conda run -n ros2py310 python infer.py  --profile repro_20260210_forest_a_cnn_ddqn_strict_no_fallback_v4p3p1_smoke300
+conda run -n ros2py310 python train.py --profile v7p1
+conda run -n ros2py310 python infer.py  --profile v7p1
 ```
 
 ---
