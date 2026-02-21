@@ -3,9 +3,9 @@
 ## 1. 本轮命令
 - 远端 self-check：
   - `ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --self-check && /home/sun/miniconda3/bin/conda run -n ros2py310 python infer.py --self-check"`
-- 远端 smoke 训练：
+- 远端 smoke（micro-smoke）训练：
   - `ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --profile v7p2 --episodes 40 --out v7p2_smoke --device cuda --progress"`
-- 远端 smoke 推理：
+- 远端 smoke（micro-smoke）推理：
   - `ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python infer.py --profile v7p2 --models v7p2_smoke --runs 3 --out v7p2_smoke --progress"`
 - 结果回传：
   - `rsync -avz ubuntu-zt:/home/sun/phdproject/dqn/dqn/runs/v7p2_smoke/ /home/sun/phdproject/dqn/dqn/runs/v7p2_smoke/`
@@ -14,12 +14,12 @@
 - self-check：
   - `run_dir`: `N/A`（自检不产出 run 目录）
   - `run.json`: `N/A`
-- smoke train：
+- smoke（micro-smoke）train：
   - `run_dir`：`runs/v7p2_smoke/train_20260220_211732`
   - `run.json`：`runs/v7p2_smoke/train_20260220_211732/configs/run.json`
   - `train_meta`：`runs/v7p2_smoke/train_20260220_211732/configs/train_meta_forest_a.json`
   - `train_flow_log`：`runs/v7p2_smoke/train_20260220_211732/train_flow.log`
-- smoke infer：
+- smoke（micro-smoke）infer：
   - `run_dir`：`runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137`
   - `run.json`：`runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137/configs/run.json`
   - KPI（均值）：`runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137/table2_kpis_mean_raw.csv`
@@ -29,10 +29,10 @@
 - self-check：
   - `train.py --self-check`：通过（CUDA 可用）
   - `infer.py --self-check`：通过（CUDA 架构支持）
-- smoke train：
+- smoke（micro-smoke）train：
   - `episodes=40/40`，`stop_reason=completed`
   - 训练完成并保存模型：`runs/v7p2_smoke/train_20260220_211732/models/forest_a/cnn-ddqn.pt`
-- smoke infer（runs=3）：
+- smoke（micro-smoke，runs=3）：
   - short（CNN）：`success_rate=1.00`，`avg_path_length=20.0492`，`path_time_s=11.6833`
   - mid（CNN）：`success_rate=0.333`，`avg_path_length=26.9989`，`path_time_s=14.8000`
   - long（CNN）：`success_rate=1.00`，`avg_path_length=65.6659`，`path_time_s=44.5333`
@@ -43,7 +43,7 @@
   - `failure_reason`（Hybrid 汇总）：`reached=9`
 
 ## 4. 备注
-- 本轮遵循 `self-check -> smoke`，尚未进入 full（`runs=20`）门槛评测。
+- 本轮遵循 `self-check -> smoke（micro-smoke）`，尚未进入 full（`runs=20`）门槛评测。
 - `v7p2` 仅修复观测一致性，训练/推理策略口径保持 `shielded/hybrid`。
 
 ## 5. 追加运行（2026-02-20，full300 best vs final）

@@ -13,5 +13,9 @@ runs/
 !docs/versions/**/runs/
 !docs/versions/**/runs/README.md
 
+# Keep tracked run-ops docs under docs/runs/
+!docs/runs/
+!docs/runs/**
+
 # Legacy archived experiment dumps (option B cleanup)
 2026/

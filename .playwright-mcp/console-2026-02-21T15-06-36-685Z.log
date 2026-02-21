@@ -1,0 +1,11 @@
+[    3631ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://www.tandfonline.com/doi/full/10.1080/21642583.2026.2622157:0
+[    4732ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://www.tandfonline.com/favicon.ico:0
+[    9227ms] [ERROR] Failed to load resource: the server responded with a status of 403 () @ https://www.tandfonline.com/favicon.ico:0
+[   10137ms] [ERROR] Failed to load resource: the server responded with a status of 401 () @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/pat/9d172639486e1386/1771686405242/9735a3daf48e30b91bf96de540ef00c1914d74462d2c2ce5b29d1dcd879479a2/-Zx794SPG9dFfko:0
+[   10188ms] [ERROR] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/qwb3z/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
+[   10188ms] [ERROR] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/qwb3z/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
+[   10189ms] [WARNING] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/qwb3z/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
+[   10189ms] [WARNING] %c%d font-size:0;color:transparent NaN @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/qwb3z/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
+[   10367ms] [WARNING] No available adapters. @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/qwb3z/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
+[   10407ms] [ERROR]  Note that 'script-src' was not explicitly set, so 'default-src' is used as a fallback. @ https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/qwb3z/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto:0
+[   22428ms] [WARNING] MathJax: Invalid option "allowTexHTML" (no default value). @ https://www.tandfonline.com/templates/jsp/js/MathJax/4.0.0-beta.4/tex-mml-chtml.js:0

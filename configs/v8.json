@@ -14,7 +14,7 @@
     "rl_algos": ["cnn-sac"],
     "episodes": 3000,
     "max_steps": 1200,
-    "gamma": 0.99,
+    "gamma": 0.98,
     "device": "cuda",
     "cuda_device": 0,
     "seed": 21,
@@ -65,7 +65,13 @@
     "save_ckpt_short_max_dist_m": 14.0,
     "save_ckpt_long_min_dist_m": 14.0,
     "save_ckpt_long_max_dist_m": 0.0,
-    "no_terminate_on_stuck": true
+    "sac_reward_clip_min": -500.0,
+    "sac_reward_clip_max": 1100.0,
+    "sac_target_q_min": -50.0,
+    "sac_target_q_max": 50.0,
+    "sac_use_huber_loss": true,
+    "sac_critic_warmup_steps": 2000,
+    "sac_eval_interval": 50
   },
   "infer": {
     "envs": [
@@ -86,7 +92,6 @@
     "global_map_channels": 3,
     "forest_no_fallback": true,
     "max_steps": 1200,
-    "no_terminate_on_stuck": true,
     "goal_tolerance_m": 1.0,
     "goal_angle_tolerance_deg": 180.0,
     "goal_stop_speed_m_s": 0.1,

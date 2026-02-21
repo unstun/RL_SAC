@@ -4,7 +4,7 @@
 - 上一版本：`v7p1`
 - 本版口径：`shielded/hybrid`（训练与推理规则保持不变）
 - 对外表述（文档/论文）：`CNN-DDQN (shielded/hybrid inference)`，不宣称 `strict-argmax`
-- 状态：**已运行 smoke + full300（best/final）并完成 short/mid/long 各 runs=20 对比**
+- 状态：**已运行 smoke（micro-smoke，episodes=40）+ full300（best/final）并完成 short/mid/long 各 runs=20 对比**
 
 ## 本版目标
 - 修复 `AMRBicycleEnv`（Ackermann 车辆环境）中的部分马尔可夫性缺口：
@@ -24,9 +24,9 @@
 ## 本轮执行记录（2026-02-20）
 - 远端 self-check：
   - `ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --self-check && /home/sun/miniconda3/bin/conda run -n ros2py310 python infer.py --self-check"`
-- 远端 smoke 训练：
+- 远端 smoke（micro-smoke）训练：
   - `ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python train.py --profile v7p2 --episodes 40 --out v7p2_smoke --device cuda --progress"`
-- 远端 smoke 推理：
+- 远端 smoke（micro-smoke）推理：
   - `ssh ubuntu-zt "cd /home/sun/phdproject/dqn/dqn && /home/sun/miniconda3/bin/conda run -n ros2py310 python infer.py --profile v7p2 --models v7p2_smoke --runs 3 --out v7p2_smoke --progress"`
 - 结果回传：
   - `rsync -avz ubuntu-zt:/home/sun/phdproject/dqn/dqn/runs/v7p2_smoke/ /home/sun/phdproject/dqn/dqn/runs/v7p2_smoke/`
@@ -35,7 +35,7 @@
 - 自检：
   - `conda run -n ros2py310 python train.py --self-check`
   - `conda run -n ros2py310 python infer.py --self-check`
-- smoke：
+- smoke（micro-smoke）：
   - `conda run -n ros2py310 python train.py --profile v7p2 --episodes 40 --out v7p2_smoke --device cuda --progress`
   - `conda run -n ros2py310 python infer.py --profile v7p2 --models v7p2_smoke --runs 3 --out v7p2_smoke`
 
@@ -92,4 +92,4 @@
 ## 下一步
 1. 以 `best` 作为 `v7p2` 主结果继续后续版本迭代，`final` 作为 ablation（消融对照）保留。
 2. 定位 `final` 在 long 套件 `planning_time_s` 激增的触发条件（优先排查不可行动作率上升与重规划频率）。
-3. 若下一版继续尝试 `final`，建议先做小规模 smoke 对 long 进行定向验证再上 full。
+3. 若下一版继续尝试 `final`，建议先做小规模 smoke（micro-smoke）对 long 进行定向验证再上 full。

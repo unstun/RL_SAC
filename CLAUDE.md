@@ -17,9 +17,6 @@
 
    - 修 bug：优先“加失败测试 → 修复 → 全绿”。
    - 重构：必须保证行为不变（见验收标准），并说明如何验证。
-4) **默认不引入新依赖**
-
-   - 未经明确说明，不新增依赖或不升级大版本。确需新增：先解释理由、替代方案、影响面。
 5) **称呼约定**
 
    - 每次回复默认以“`帅哥，`”开头（除非你明确要求不需要）。
@@ -51,8 +48,8 @@
 8) **仓库研究目标**
 
    - 最终目标：在森林场景车辆运动规划任务中，提出可复现、可验证的强化学习方法；在统一评测口径下相对多类基线（强化学习基线、传统规划+MPC 基线）达到更优综合性能，重点指标为 `success_rate`（越大越好）、`avg_path_length`（越小越好）、`path_time_s`（越小越好）。
-   - 当前主线：`v7p1`（当前稳定回退基线）；`v8`（SAC-GlobalCNN）为迁移目标版本，当前处于方案落地阶段（见 `docs/plans/2026-02-20-sac-globalcnn-*.md`）。
-   - 当前状态：最终目标尚未达成；截至最新归档，`v7p1` 为阶段性最优结果。当前可执行主流程仍以 `CNN-DDQN` 为主，SAC 正在迁移中。
+   - 当前主线：`v7p1`（CNN-DDQN 稳定基线，short/long SR=100%）；SAC 迁移分支已推进到 `v8p2`（CBF-Safe SAC），当前 smoke SR=0% 但训练信号正向（best_return=477.5）。
+   - 当前状态：最终目标尚未达成；`v7p1` 为 CNN-DDQN 阶段性最优结果。SAC 迁移链：`v8`（训练发散）→ `v8p1`（稳定性修复）→ `v8p2`（CBF 安全过滤 + 奖励塑形），下一步为 `v8p3`（课程学习 + alpha 下界）。
    - 方法边界：不限制于 `CNN-DDQN`；允许新增/替换模块或引入其他强化学习算法，但必须满足学术定义合规、可复现留档与门槛验证要求（见第 9、13、16 条）。
 9) **学术定义合规（硬约束）**
 
@@ -144,6 +141,23 @@
 - 最小归档内容：在对应 `docs/versions/<version>/` 四件套中至少记录本次运行命令、`run_dir`、`run_json`、`kpi` 路径、short/long 关键指标与 `failure_reason` 分布（若该次运行产出该字段）。
 - 运行失败也必须归档：若结果缺失，必须写 `N/A` 并注明失败原因（如报错中断、超时、人工终止）。
 
+17) **文件写入限制（Claude Code 客户端问题，硬约束）**
+
+- 单次 Write / Edit 工具调用写入内容不得超过 50 行；超过时必须拆成多次调用（先 Write 前 50 行，再用 Edit 追加后续内容）。
+- 原因：Claude Code 客户端在单次写入过大时会静默报错或进入死循环，导致工具调用反复失败。
+- 同理适用于生成大段代码、长 Markdown 文档等场景：宁可多调用几次，不要一次性写完。
+
+18) **联网调研注意事项（Claude Code 客户端问题）**
+
+- WebFetch 和 WebSearch 不混在同一批并行调用（WebFetch 403 会级联拖垮同批 WebSearch）。
+- 每批并行最多 2 个同类调用。
+- 优先 arXiv / GitHub 等开放源。
+- PDF 链接大概率解析失败，优先用 HTML 版本（如 `arxiv.org/html/`）。
+- **付费墙站点（tandfonline / sciencedirect / springer）**：WebFetch 会 403，改用 Playwright：
+  1. `browser_navigate` 打开 URL
+  2. `browser_wait_for` 等 5 秒（Cloudflare 自动验证）
+  3. `browser_snapshot` 获取页面内容
+
 ## 默认环境
 
 - 操作系统：Ubuntu 24.04
@@ -165,5 +179,5 @@ conda run -n ros2py310 python infer.py --self-check
   - `AGENTS.md` 与 `CLAUDE.md` 保持逐行一致；可用 `diff -u AGENTS.md CLAUDE.md` 验证。
   - 引用的关键路径存在：`train.py`、`infer.py`、`configs/`、`paper/`。
 - 过程层面
-  - 后续任何实现改动均遵守：先计划后动手、小步变更、默认不引入依赖、学术定义合规、可复现性约束（除非你明确豁免）。
+  - 后续任何实现改动均遵守：先计划后动手、小步变更、学术定义合规、可复现性约束（除非你明确豁免）。
   - 默认执行两阶段验证（smoke 优先），最终结论使用 short/long + runs=20 的硬门槛口径。

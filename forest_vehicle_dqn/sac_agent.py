@@ -32,6 +32,12 @@ class SACConfig:
     target_entropy: float = -2.0  # -dim(action)
     reward_scale: float = 0.01  # scale raw rewards to stabilize Q-values
     grad_clip_norm: float = 1.0  # max gradient norm for critic/actor
+    reward_clip_min: float = -500.0  # clip raw reward lower bound
+    reward_clip_max: float = 1100.0  # clip raw reward upper bound
+    target_q_min: float = -50.0  # clamp target Q lower bound
+    target_q_max: float = 50.0   # clamp target Q upper bound
+    use_huber_loss: bool = True   # use Huber (smooth_l1) instead of MSE for critic
+    critic_warmup_steps: int = 2000  # critic-only updates before actor starts
 
 
 class SACReplayBuffer:
@@ -132,6 +138,8 @@ class SACAgent:
         return action.cpu().numpy().squeeze(0)
 
     def observe(self, obs, action, reward, next_obs, done):
+        reward = float(np.clip(reward, self.cfg.reward_clip_min,
+                               self.cfg.reward_clip_max))
         self.buffer.add(
             obs["maps"], obs["scalars"], action, reward,
             next_obs["maps"], next_obs["scalars"], done)
@@ -159,9 +167,15 @@ class SACAgent:
             tq1, tq2 = self.critic_target(n_maps_t, n_scalars_t, n_action)
             target_q = torch.min(tq1, tq2) - alpha * n_log_prob.unsqueeze(1)
             target_q = rewards_t + (1 - dones_t) * self.cfg.gamma * target_q
+            target_q = target_q.clamp(self.cfg.target_q_min,
+                                      self.cfg.target_q_max)
 
         q1, q2 = self.critic(maps_t, scalars_t, actions_t)
-        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+        if self.cfg.use_huber_loss:
+            critic_loss = (F.smooth_l1_loss(q1, target_q)
+                           + F.smooth_l1_loss(q2, target_q))
+        else:
+            critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -186,6 +200,8 @@ class SACAgent:
             log_prob.detach() + self.target_entropy)).mean()
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [self.log_alpha], self.cfg.grad_clip_norm)
         self.alpha_opt.step()
 
         # --- Soft target update ---
@@ -198,7 +214,63 @@ class SACAgent:
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
             "alpha": self.alpha,
+            "q1_mean": q1.mean().item(),
+            "q2_mean": q2.mean().item(),
+            "target_q_mean": target_q.mean().item(),
+            "target_q_max": target_q.max().item(),
+            "reward_batch_mean": rewards_t.mean().item(),
         }
+
+    def update_critic_only(self) -> Dict[str, float]:
+        """Single critic update step (no actor/alpha update)."""
+        if self.buffer.size < self.cfg.batch_size:
+            return {}
+        maps, scalars, actions, rewards, n_maps, n_scalars, dones = \
+            self.buffer.sample(self.cfg.batch_size, self._rng)
+
+        maps_t = torch.as_tensor(maps, device=self.device)
+        scalars_t = torch.as_tensor(scalars, device=self.device)
+        actions_t = torch.as_tensor(actions, device=self.device)
+        rewards_t = torch.as_tensor(rewards, device=self.device).unsqueeze(1)
+        rewards_t = rewards_t * self.cfg.reward_scale
+        n_maps_t = torch.as_tensor(n_maps, device=self.device)
+        n_scalars_t = torch.as_tensor(n_scalars, device=self.device)
+        dones_t = torch.as_tensor(dones, device=self.device).unsqueeze(1)
+
+        alpha = self.log_alpha.exp().detach()
+
+        with torch.no_grad():
+            n_action, n_log_prob = self.actor.sample(n_maps_t, n_scalars_t)
+            tq1, tq2 = self.critic_target(n_maps_t, n_scalars_t, n_action)
+            target_q = torch.min(tq1, tq2) - alpha * n_log_prob.unsqueeze(1)
+            target_q = rewards_t + (1 - dones_t) * self.cfg.gamma * target_q
+            target_q = target_q.clamp(self.cfg.target_q_min,
+                                      self.cfg.target_q_max)
+
+        q1, q2 = self.critic(maps_t, scalars_t, actions_t)
+        if self.cfg.use_huber_loss:
+            critic_loss = (F.smooth_l1_loss(q1, target_q)
+                           + F.smooth_l1_loss(q2, target_q))
+        else:
+            critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), self.cfg.grad_clip_norm)
+        self.critic_opt.step()
+
+        with torch.no_grad():
+            for tp, p in zip(self.critic_target.parameters(),
+                             self.critic.parameters()):
+                tp.data.mul_(1 - self.cfg.tau).add_(p.data, alpha=self.cfg.tau)
+
+        return {"critic_loss": critic_loss.item()}
+
+    def warmup_critic(self, steps: int) -> None:
+        """Run critic-only updates to bootstrap Q-estimates after BC."""
+        for _ in range(steps):
+            self.update_critic_only()
 
     def pretrain_bc(self, demos: list, *, steps: int = 5000):
         """Behavior cloning pretraining from expert demonstrations."""
