@@ -3076,6 +3076,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.08,
         help="Forest-only: speed threshold (m/s) used by no-progress penalty.",
     )
+    # SAC-specific args (used by v8 config, passed through to train_one_sac)
+    ap.add_argument("--forest-reward-k-p", type=float, default=12.0)
+    ap.add_argument("--forest-reward-k-kappa", type=float, default=0.2)
+    ap.add_argument("--forest-reward-k-len", type=float, default=0.0)
+    ap.add_argument("--forest-action-mode", type=str, default="discrete")
+    ap.add_argument("--sac-lr-actor", type=float, default=3e-4)
+    ap.add_argument("--sac-lr-critic", type=float, default=3e-4)
+    ap.add_argument("--sac-lr-alpha", type=float, default=3e-4)
+    ap.add_argument("--sac-tau", type=float, default=0.005)
+    ap.add_argument("--sac-batch-size", type=int, default=256)
+    ap.add_argument("--sac-buffer-size", type=int, default=1_000_000)
+    ap.add_argument("--sac-hidden-dim", type=int, default=256)
+    ap.add_argument("--sac-target-entropy", type=float, default=-2.0)
+    ap.add_argument("--sac-bc-pretrain-steps", type=int, default=0)
+    ap.add_argument("--global-map-size", type=int, default=48)
+    ap.add_argument("--global-map-channels", type=int, default=3)
+
     ap.add_argument(
         "--forest-expert",
         choices=("auto", "hybrid_astar", "astar_mpc", "hybrid_astar_mpc"),

@@ -1200,6 +1200,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print CUDA/runtime info and exit (use to verify CUDA setup).",
     )
+    # SAC-specific args (used by v8 config)
+    ap.add_argument("--forest-action-mode", type=str, default="discrete")
+    ap.add_argument("--global-map-size", type=int, default=48)
+    ap.add_argument("--global-map-channels", type=int, default=3)
     return ap
 
 
