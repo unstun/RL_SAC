@@ -38,6 +38,10 @@ class SACConfig:
     target_q_max: float = 50.0   # clamp target Q upper bound
     use_huber_loss: bool = True   # use Huber (smooth_l1) instead of MSE for critic
     critic_warmup_steps: int = 2000  # critic-only updates before actor starts
+    # TECRL (reward-entropy separation)
+    use_tecrl: bool = False
+    lr_entropy_critic: float = 3e-4
+    entropy_budget_ratio: float = 0.6  # ρ: trajectory entropy budget
 
 
 class SACReplayBuffer:
@@ -101,6 +105,25 @@ class SACAgent:
         self.critic_target = copy.deepcopy(self.critic)
         for p in self.critic_target.parameters():
             p.requires_grad_(False)
+
+        # TECRL: entropy critic (estimates cumulative entropy)
+        self.use_tecrl = config.use_tecrl
+        if self.use_tecrl:
+            enc_ent = GlobalCNNEncoder(
+                config.map_size, config.map_channels, config.scalar_dim)
+            self.entropy_critic = SACEntropyCritic(
+                enc_ent, config.action_dim, config.hidden_dim
+            ).to(self.device)
+            self.entropy_critic_target = copy.deepcopy(self.entropy_critic)
+            for p in self.entropy_critic_target.parameters():
+                p.requires_grad_(False)
+            self.entropy_critic_opt = torch.optim.Adam(
+                self.entropy_critic.parameters(), lr=config.lr_entropy_critic)
+            # H_budget = ρ * H_0 / (1 - γ), H_0 = -dim(action)
+            self.entropy_budget = (
+                config.entropy_budget_ratio * (-config.action_dim)
+                / (1.0 - config.gamma)
+            )
 
         # Automatic entropy tuning
         self.log_alpha = torch.zeros(
