@@ -1,6 +1,6 @@
-# 版本留档索引（v1 → v7p2p1，含 v7p1 补档；v8 为 SAC 迁移中）
+# 版本留档索引（v1 → v8p2）
 
-- 归档入口：仓库根目录 `README.md` 的“版本总索引（v1 → v7p2p1）”。
+- 归档入口：仓库根目录 `README.md` 的”版本总索引（v1 → v8p2）”。
 - 本文件保留为 `docs/versions/` 内部快速导航，与根 README 保持同一口径。
 - 历史目录 `v3p1`~`v3p11` 保留原始记录，未纳入本轮重编号。
 - 早期误混入版本链已于 2026-02-09 清理，当前主线编号延续至 `v7p2p1`。
@@ -32,6 +32,14 @@
 | `v7p1` | `v7p1` | `docs/versions/v7p1/` | `configs/v7p1.json` | `runs/v7p1_train300_esbest/train_20260221_010743/infer/20260221_011927` | `1.00` / `1.00` | `1.00` / `1.00` | 稳定主线（runs=5，待 full20） |
 | `v7p2` | `v7p2` | `docs/versions/v7p2/` | `configs/v7p2.json` | `runs/v7p2_smoke/train_20260220_211732/infer/20260220_212137` | `1.00` / `1.00` | `1.00` / `1.00` | 已运行（smoke/micro-smoke：episodes=40, runs=3） |
 | `v7p2p1` | `v7p2p1` | `docs/versions/v7p2p1/` | `configs/repro_20260220_v7p2p1_rollback_v7p1.json` | `runs/v7p2_es150/train_20260220_222056/infer/20260220_223016` | `0.85` / `0.65` | `0.95` / `1.00` | 失败归档，主线回退到 `v7p1` |
+
+## SAC 迁移版本（v8 →）
+
+| 版本 | 目录 | 主 config | 关键 run | CNN-SAC SR (short/long) | 基线 SR (short/long) | 状态 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `v8` | `docs/versions/v8/` | `configs/v8.json` | `runs/v8-mid3/train_20260221_190531` | `0.0` / `0.0` | `1.0` / `1.0` | 训练发散，SR=0% |
+| `v8p1` | `docs/versions/v8p1/` | `configs/v8.json` | `runs/v8-fix1/train_20260221_212443` | `0.0` / `0.0` | `1.0` / `1.0` | 稳定性修复成功，smoke SR=0%（150ep 不足） |
+| `v8p2` | `docs/versions/v8p2/` | `configs/v8p2.json` | `runs/v8p2-smoke1/train_20260221_224028` | `0.0` / `0.0` | `1.0` / `1.0` | CBF-Safe SAC，smoke SR=0%（150ep），best_return=477.5 |
 
 ## baseline-only 排除口径
 - 上表“关键 run”仅统计 RL 运行（`skip_rl=false`）。
