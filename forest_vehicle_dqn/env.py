@@ -604,6 +604,7 @@ class AMRBicycleEnv(gym.Env):
         reward_k_delta: float = 1.5,
         reward_k_a: float = 0.2,
         reward_k_kappa: float = 0.2,
+        reward_k_len: float = 0.0,
         reward_k_o: float = 1.5,
         reward_k_v: float = 2.0,
         reward_k_c: float = 0.0,
@@ -750,6 +751,7 @@ class AMRBicycleEnv(gym.Env):
         self.reward_k_delta = float(reward_k_delta)
         self.reward_k_a = float(reward_k_a)
         self.reward_k_kappa = float(reward_k_kappa)
+        self.reward_k_len = float(reward_k_len)
         self.reward_k_o = float(reward_k_o)
         self.reward_k_v = float(reward_k_v)
         self.reward_k_c = float(reward_k_c)
@@ -1343,6 +1345,12 @@ class AMRBicycleEnv(gym.Env):
         reward -= self.reward_k_a * float(a - prev_a) ** 2 * float(v_scale)
         # Curvature / large steering penalty
         reward -= self.reward_k_kappa * float(math.tan(delta_next) ** 2)
+        # Path length penalty (per-step distance traveled)
+        if self.reward_k_len > 0.0:
+            step_dist = float(math.hypot(
+                float(self._x_m) - float(x_before),
+                float(self._y_m) - float(y_before)))
+            reward -= self.reward_k_len * step_dist
         # Clearance-based safety shaping. Skip when already in collision to avoid compounding huge penalties.
         if not collision:
             od_pos = max(0.0, float(od_m))
