@@ -2301,3 +2301,90 @@ class AMRBicycleEnv(gym.Env):
                     break
             out[i] = float(np.clip((hit_cells * self.cell_size_m) / float(self.sensor_range_m), 0.0, 1.0))
         return out
+
+    # ------------------------------------------------------------------
+    # SAC global-map observation
+    # ------------------------------------------------------------------
+
+    def get_global_map(self, *, channels: int = 3,
+                       map_size: int = 48) -> np.ndarray:
+        """Return (C, map_size, map_size) float32 global map for SAC.
+
+        Ch0: occupancy grid (0=free, 1=obstacle)
+        Ch1: agent position Gaussian blob
+        Ch2: goal position Gaussian blob
+        """
+        sz = int(map_size)
+        # Ch0 – occupancy (nearest-neighbour downsample)
+        occ = cv2.resize(
+            self._grid.astype(np.float32, copy=False),
+            dsize=(sz, sz), interpolation=cv2.INTER_NEAREST,
+        )
+
+        # Helper: Gaussian blob at (x_m, y_m) on the downsampled grid
+        def _blob(x_m: float, y_m: float) -> np.ndarray:
+            max_x = max(1e-6, float(self._width - 1) * self.cell_size_m)
+            max_y = max(1e-6, float(self._height - 1) * self.cell_size_m)
+            cx = float(x_m) / max_x * (sz - 1)
+            cy = float(y_m) / max_y * (sz - 1)
+            xs = np.arange(sz, dtype=np.float32)
+            ys = np.arange(sz, dtype=np.float32)
+            gx = np.exp(-0.5 * ((xs - cx) / max(1.0, sz / 8.0)) ** 2)
+            gy = np.exp(-0.5 * ((ys - cy) / max(1.0, sz / 8.0)) ** 2)
+            return np.outer(gy, gx).astype(np.float32)
+
+        # Ch1 – agent blob
+        agent_blob = _blob(float(self._x_m), float(self._y_m))
+        # Ch2 – goal blob
+        gx_m = float(self.goal_xy[0]) * self.cell_size_m
+        gy_m = float(self.goal_xy[1]) * self.cell_size_m
+        goal_blob = _blob(gx_m, gy_m)
+
+        return np.stack([occ, agent_blob, goal_blob], axis=0).astype(
+            np.float32, copy=False)
+
+    def observe_sac(self, *, map_size: int = 48) -> dict:
+        """Return SAC observation dict: {maps: (3,H,W), scalars: (D,)}."""
+        maps = self.get_global_map(channels=3, map_size=map_size)
+
+        # Reuse scalar computation from _observe()
+        max_x = max(1e-6, float(self._width - 1) * self.cell_size_m)
+        max_y = max(1e-6, float(self._height - 1) * self.cell_size_m)
+        ax_n = float(np.clip(2.0 * float(self._x_m) / max_x - 1.0, -1, 1))
+        ay_n = float(np.clip(2.0 * float(self._y_m) / max_y - 1.0, -1, 1))
+        gx_n = float(np.clip(
+            2.0 * (float(self.goal_xy[0]) * self.cell_size_m) / max_x - 1.0,
+            -1, 1))
+        gy_n = float(np.clip(
+            2.0 * (float(self.goal_xy[1]) * self.cell_size_m) / max_y - 1.0,
+            -1, 1))
+        sin_psi = float(np.clip(math.sin(float(self._psi_rad)), -1, 1))
+        cos_psi = float(np.clip(math.cos(float(self._psi_rad)), -1, 1))
+        v_n = float(np.clip(
+            float(self._v_m_s) / float(self.model.v_max_m_s), -1, 1))
+        delta_lim = float(self.model.delta_max_rad)
+        delta_n = float(np.clip(
+            0.0 if abs(delta_lim) < 1e-9
+            else float(self._delta_rad) / delta_lim, -1, 1))
+        alpha_n = float(np.clip(
+            float(self._goal_relative_angle_rad()) / math.pi, -1, 1))
+        od01 = min(self.od_cap_m, max(0.0, float(self._last_od_m))) / float(
+            self.od_cap_m)
+        od_n = float(np.clip(2.0 * od01 - 1.0, -1, 1))
+
+        # Extra scalars for SAC: prev controls + path length so far
+        dd_max = float(self.model.delta_dot_max_rad_s)
+        a_max = float(self.model.a_max_m_s2)
+        prev_dd_n = float(np.clip(
+            0.0 if abs(dd_max) < 1e-9
+            else float(self._prev_delta_dot) / dd_max, -1, 1))
+        prev_a_n = float(np.clip(
+            0.0 if abs(a_max) < 1e-9
+            else float(self._prev_a) / a_max, -1, 1))
+
+        scalars = np.array([
+            ax_n, ay_n, gx_n, gy_n, sin_psi, cos_psi,
+            v_n, delta_n, alpha_n, od_n, prev_dd_n, prev_a_n,
+        ], dtype=np.float32)
+
+        return {"maps": maps, "scalars": scalars}
