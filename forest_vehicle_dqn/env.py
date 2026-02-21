@@ -1439,6 +1439,120 @@ class AMRBicycleEnv(gym.Env):
         a = float(np.clip(float(a_m_s2), -a_max, +a_max))
         return self._step_with_controls(delta_dot=delta_dot, a=a)
 
+    # ------------------------------------------------------------------
+    # CBF Safety Filter (v8p2)
+    # ------------------------------------------------------------------
+    def cbf_safe_action(
+        self,
+        delta_dot_norm: float,
+        a_norm: float,
+        *,
+        alpha_cbf: float = 0.3,
+        safety_margin: float = 0.15,
+    ) -> tuple[float, float, dict]:
+        """Discrete-time CBF safety filter for continuous actions.
+
+        Args:
+            delta_dot_norm: normalised steering rate in [-1, 1]
+            a_norm: normalised acceleration in [-1, 1]
+            alpha_cbf: CBF decay rate (0 < α < 1)
+            safety_margin: additional safety margin in metres
+
+        Returns:
+            (dd_safe, a_safe, info) where info contains ``cbf_intervened``.
+        """
+        dd_raw = float(np.clip(float(delta_dot_norm), -1.0, 1.0))
+        a_raw = float(np.clip(float(a_norm), -1.0, 1.0))
+
+        # Current barrier value: h = min_od - safety_margin
+        od_curr, _ = self._od_and_collision_m()
+        h_curr = float(od_curr) - float(safety_margin)
+
+        # Emergency brake when already inside unsafe set
+        if h_curr <= 0.0:
+            return 0.0, -1.0, {"cbf_intervened": True, "cbf_mode": "emergency"}
+
+        # Convert normalised action to physical controls
+        dd_max = float(self.model.delta_dot_max_rad_s)
+        a_max = float(self.model.a_max_m_s2)
+        dd_phys = dd_raw * dd_max
+        a_phys = a_raw * a_max
+
+        # Simulate one step with raw action
+        x_n, y_n, psi_n, _, _ = bicycle_integrate_one_step(
+            x_m=float(self._x_m), y_m=float(self._y_m),
+            psi_rad=float(self._psi_rad), v_m_s=float(self._v_m_s),
+            delta_rad=float(self._delta_rad),
+            delta_dot_rad_s=dd_phys, a_m_s2=a_phys, params=self.model,
+        )
+        od_next, _ = self._od_and_collision_at_pose_m(x_n, y_n, psi_n)
+        h_next = float(od_next) - float(safety_margin)
+
+        # CBF constraint: h_next >= (1 - α) * h_curr
+        threshold = (1.0 - float(alpha_cbf)) * h_curr
+        violation = threshold - h_next
+
+        if violation <= 0.0:
+            # Safe — pass through
+            return dd_raw, a_raw, {"cbf_intervened": False, "cbf_mode": "safe"}
+
+        # --- Projection via numerical gradient ---
+        eps = 1e-3
+        grad = np.zeros(2, dtype=np.float64)
+        for dim in range(2):
+            u_plus = [dd_phys, a_phys]
+            u_minus = [dd_phys, a_phys]
+            scale = dd_max if dim == 0 else a_max
+            u_plus[dim] += eps * scale
+            u_minus[dim] -= eps * scale
+            # Forward
+            xp, yp, pp, _, _ = bicycle_integrate_one_step(
+                x_m=float(self._x_m), y_m=float(self._y_m),
+                psi_rad=float(self._psi_rad), v_m_s=float(self._v_m_s),
+                delta_rad=float(self._delta_rad),
+                delta_dot_rad_s=u_plus[0], a_m_s2=u_plus[1], params=self.model,
+            )
+            od_p, _ = self._od_and_collision_at_pose_m(xp, yp, pp)
+            h_p = float(od_p) - float(safety_margin)
+            # Backward
+            xm, ym, pm, _, _ = bicycle_integrate_one_step(
+                x_m=float(self._x_m), y_m=float(self._y_m),
+                psi_rad=float(self._psi_rad), v_m_s=float(self._v_m_s),
+                delta_rad=float(self._delta_rad),
+                delta_dot_rad_s=u_minus[0], a_m_s2=u_minus[1], params=self.model,
+            )
+            od_m, _ = self._od_and_collision_at_pose_m(xm, ym, pm)
+            h_m = float(od_m) - float(safety_margin)
+            grad[dim] = (h_p - h_m) / (2.0 * eps * scale)
+
+        grad_norm_sq = float(np.dot(grad, grad))
+        if grad_norm_sq < 1e-12:
+            # Gradient too small — fallback brake
+            return 0.0, -1.0, {"cbf_intervened": True, "cbf_mode": "fallback"}
+
+        # Linear projection: u_safe = u_raw + (violation / ||∇h||²) * ∇h
+        correction = (violation / grad_norm_sq) * grad
+        dd_safe_phys = dd_phys + correction[0] * dd_max
+        a_safe_phys = a_phys + correction[1] * a_max
+        dd_safe = float(np.clip(dd_safe_phys / dd_max, -1.0, 1.0))
+        a_safe = float(np.clip(a_safe_phys / a_max, -1.0, 1.0))
+
+        # Verify projection
+        xv, yv, pv, _, _ = bicycle_integrate_one_step(
+            x_m=float(self._x_m), y_m=float(self._y_m),
+            psi_rad=float(self._psi_rad), v_m_s=float(self._v_m_s),
+            delta_rad=float(self._delta_rad),
+            delta_dot_rad_s=dd_safe * dd_max, a_m_s2=a_safe * a_max,
+            params=self.model,
+        )
+        od_v, _ = self._od_and_collision_at_pose_m(xv, yv, pv)
+        h_v = float(od_v) - float(safety_margin)
+        if h_v < threshold:
+            # Projection failed — fallback brake
+            return 0.0, -1.0, {"cbf_intervened": True, "cbf_mode": "fallback"}
+
+        return dd_safe, a_safe, {"cbf_intervened": True, "cbf_mode": "projected"}
+
     def _agent_xy_for_plot(self) -> tuple[float, float]:
         return (float(self._x_m) / self.cell_size_m, float(self._y_m) / self.cell_size_m)
 
