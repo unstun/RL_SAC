@@ -428,6 +428,109 @@ def _estimate_path_yaw_rad(path_xy_cells: list[tuple[float, float]]) -> list[flo
     return out
 
 
+def rollout_sac(
+    env: AMRBicycleEnv,
+    agent,  # SACAgent
+    *,
+    max_steps: int,
+    seed: int,
+    reset_options: dict[str, object] | None = None,
+    time_mode: str = "rollout",
+    global_map_size: int = 48,
+    collect_controls: bool = False,
+) -> RolloutResult:
+    """Rollout a SAC agent with continuous actions."""
+    obs_raw, info0 = env.reset(seed=seed, options=reset_options)
+    obs = env.observe_sac(map_size=global_map_size)
+    path: list[tuple[float, float]] = [
+        (float(env.start_xy[0]), float(env.start_xy[1]))]
+    dt_s = float(env.model.dt)
+
+    t_series: list[float] | None = None
+    v_series: list[float] | None = None
+    delta_series: list[float] | None = None
+    if collect_controls:
+        t_series = [0.0]
+        v_series = [float(env._v_m_s)]
+        delta_series = [float(env._delta_rad)]
+
+    inference_time_s = 0.0
+    if agent.device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t_rollout0 = time.perf_counter()
+    done = False
+    truncated = False
+    steps = 0
+    last_collision = False
+    last_stuck = False
+
+    while not (done or truncated) and steps < max_steps:
+        steps += 1
+        if time_mode == "policy":
+            if agent.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        action = agent.act(obs, explore=False)  # deterministic
+
+        if time_mode == "policy":
+            if agent.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            inference_time_s += time.perf_counter() - t0
+
+        delta_dot = float(action[0]) * float(env.model.delta_dot_max_rad_s)
+        accel = float(action[1]) * float(env.model.a_max_m_s2)
+        _, reward, done, truncated, info = env.step_continuous(
+            delta_dot_rad_s=delta_dot, a_m_s2=accel)
+        obs = env.observe_sac(map_size=global_map_size)
+
+        ax, ay = env._agent_xy_for_plot()
+        path.append((float(ax), float(ay)))
+        last_collision = bool(info.get("collision", False))
+        last_stuck = bool(info.get("stuck", False))
+
+        if collect_controls and t_series is not None:
+            t_series.append(float(steps) * dt_s)
+            v_series.append(float(info.get("v_m_s", 0.0)))
+            delta_series.append(float(info.get("delta_rad", 0.0)))
+
+    if time_mode == "rollout":
+        if agent.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_time_s = time.perf_counter() - t_rollout0
+
+    reached = bool(info.get("reached", False)) if steps > 0 else False
+    path_time_s = float(steps) * dt_s
+
+    controls = None
+    if collect_controls and t_series is not None:
+        controls = ControlTrace(
+            t_s=np.array(t_series), v_m_s=np.array(v_series),
+            delta_rad=np.array(delta_series))
+
+    failure_reason = "success"
+    if not reached:
+        if last_collision:
+            failure_reason = "collision"
+        elif last_stuck:
+            failure_reason = "stuck"
+        elif truncated or steps >= max_steps:
+            failure_reason = "timeout"
+        else:
+            failure_reason = "unknown"
+
+    return RolloutResult(
+        path_xy_cells=path,
+        compute_time_s=inference_time_s,
+        reached=reached,
+        steps=steps,
+        path_time_s=path_time_s,
+        controls=controls,
+        collision=last_collision,
+        truncated=truncated,
+        debug={"failure_reason": failure_reason},
+    )
+
 
 def infer_checkpoint_obs_dim(path: Path) -> int:
     payload = torch.load(Path(path), map_location="cpu")
@@ -1200,14 +1303,18 @@ def main(argv: list[str] | None = None) -> int:
     forest_envs = set(FOREST_ENV_ORDER)
     if int(args.max_steps) == 300 and args.envs and all(str(e) in forest_envs for e in args.envs):
         args.max_steps = 600
-    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn")
+    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-sac")
     raw_algos = [str(a).lower().strip() for a in (args.rl_algos or [])]
     if any(a == "all" for a in raw_algos):
-        raw_algos = list(canonical_all)
+        raw_algos = list(canonical_all[:-1])  # exclude cnn-sac from "all"
 
     rl_algos: list[str] = []
     unknown = []
     for a in raw_algos:
+        if a == "cnn-sac":
+            if "cnn-sac" not in rl_algos:
+                rl_algos.append("cnn-sac")
+            continue
         try:
             canonical, _arch, _base, _legacy = parse_rl_algo(a)
         except ValueError:
@@ -1890,6 +1997,7 @@ def main(argv: list[str] | None = None) -> int:
                 "cnn-dqn": "CNN-DQN",
                 "cnn-ddqn": "CNN-DDQN",
                 "cnn-pddqn": "CNN-PDDQN",
+                "cnn-sac": "CNN-SAC",
             }
             algo_seed_offset = {
                 "mlp-dqn": 20_000,
@@ -1898,6 +2006,7 @@ def main(argv: list[str] | None = None) -> int:
                 "cnn-dqn": 40_000,
                 "cnn-ddqn": 50_000,
                 "cnn-pddqn": 70_000,
+                "cnn-sac": 80_000,
             }
 
             def resolve_model_path(algo: str) -> Path:
@@ -1926,24 +2035,43 @@ def main(argv: list[str] | None = None) -> int:
                     "Point --models at a training run (or an experiment name/dir with a latest run)."
                 )
 
-            ckpt_obs_dim = infer_checkpoint_obs_dim(next(iter(algo_paths.values())))
-            for path in algo_paths.values():
-                if infer_checkpoint_obs_dim(path) != ckpt_obs_dim:
-                    raise RuntimeError(f"Observation dim mismatch between checkpoints under: {models_dir / env_base}")
+            # Check obs_dim consistency (skip SAC checkpoints which have different format)
+            dqn_algo_paths = {a: p for a, p in algo_paths.items() if str(a) != "cnn-sac"}
+            if dqn_algo_paths:
+                ckpt_obs_dim = infer_checkpoint_obs_dim(next(iter(dqn_algo_paths.values())))
+                for path in dqn_algo_paths.values():
+                    if infer_checkpoint_obs_dim(path) != ckpt_obs_dim:
+                        raise RuntimeError(f"Observation dim mismatch between checkpoints under: {models_dir / env_base}")
 
-            obs_dim = env_obs_dim
-            obs_transform = None
-            if ckpt_obs_dim != env_obs_dim:
-                raise RuntimeError(
-                    f"Checkpoint expects obs_dim={ckpt_obs_dim} but env provides obs_dim={env_obs_dim} for {env_base!r}. "
-                    "Re-train models to match the environment observation space."
-                )
+                obs_dim = env_obs_dim
+                obs_transform = None
+                if ckpt_obs_dim != env_obs_dim:
+                    raise RuntimeError(
+                        f"Checkpoint expects obs_dim={ckpt_obs_dim} but env provides obs_dim={env_obs_dim} for {env_base!r}. "
+                        "Re-train models to match the environment observation space."
+                    )
+            else:
+                obs_dim = env_obs_dim
+                obs_transform = None
 
-            agents: dict[str, DQNFamilyAgent] = {}
+            agents: dict[str, object] = {}
+            sac_agents: dict[str, object] = {}
             for algo, path in algo_paths.items():
-                a = DQNFamilyAgent(str(algo), obs_dim, n_actions, config=agent_cfg, seed=args.seed, device=device)
-                a.load(path)
-                agents[str(algo)] = a
+                if str(algo) == "cnn-sac":
+                    from forest_vehicle_dqn.sac_agent import SACAgent, SACConfig
+                    sac_cfg = SACConfig(
+                        map_size=int(getattr(args, "global_map_size", 48)),
+                        map_channels=int(getattr(args, "global_map_channels", 3)),
+                        scalar_dim=12,
+                    )
+                    sa = SACAgent(sac_cfg, device=str(device), seed=args.seed)
+                    sa.load(path)
+                    sac_agents[str(algo)] = sa
+                    agents[str(algo)] = sa
+                else:
+                    a = DQNFamilyAgent(str(algo), obs_dim, n_actions, config=agent_cfg, seed=args.seed, device=device)
+                    a.load(path)
+                    agents[str(algo)] = a
 
             for algo in args.rl_algos:
                 algo_key = str(algo)
@@ -1971,22 +2099,34 @@ def main(argv: list[str] | None = None) -> int:
                     trace_path = None
                     if bool(getattr(args, "forest_policy_save_traces", False)) and isinstance(env, AMRBicycleEnv):
                         trace_path = out_dir / "traces" / f"{_safe_slug(env_case)}__{_safe_slug(pretty)}__run{int(i)}.csv"
-                    roll = rollout_agent(
-                        env,
-                        agents[algo_key],
-                        max_steps=args.max_steps,
-                        seed=int(args.seed) + seed_base + int(i),
-                        reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
-                        time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
-                        obs_transform=obs_transform,
-                        forest_adm_horizon=int(args.forest_adm_horizon),
-                        forest_topk=int(args.forest_topk),
-                        forest_min_od_m=float(args.forest_min_od_m),
-                        forest_min_progress_m=float(args.forest_min_progress_m),
-                        forest_no_fallback=bool(getattr(args, "forest_no_fallback", False)),
-                        collect_controls=bool(int(i) in control_run_indices),
-                        trace_path=trace_path,
-                    )
+                    if algo_key in sac_agents and isinstance(env, AMRBicycleEnv):
+                        roll = rollout_sac(
+                            env,
+                            sac_agents[algo_key],
+                            max_steps=args.max_steps,
+                            seed=int(args.seed) + seed_base + int(i),
+                            reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
+                            time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
+                            global_map_size=int(getattr(args, "global_map_size", 48)),
+                            collect_controls=bool(int(i) in control_run_indices),
+                        )
+                    else:
+                        roll = rollout_agent(
+                            env,
+                            agents[algo_key],
+                            max_steps=args.max_steps,
+                            seed=int(args.seed) + seed_base + int(i),
+                            reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
+                            time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
+                            obs_transform=obs_transform,
+                            forest_adm_horizon=int(args.forest_adm_horizon),
+                            forest_topk=int(args.forest_topk),
+                            forest_min_od_m=float(args.forest_min_od_m),
+                            forest_min_progress_m=float(args.forest_min_progress_m),
+                            forest_no_fallback=bool(getattr(args, "forest_no_fallback", False)),
+                            collect_controls=bool(int(i) in control_run_indices),
+                            trace_path=trace_path,
+                        )
                     algo_times.append(float(roll.compute_time_s))
                     if int(i) in path_run_indices:
                         env_paths_by_run[int(i)][pretty] = PathTrace(path_xy_cells=roll.path_xy_cells, success=bool(roll.reached))
