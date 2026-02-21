@@ -25,7 +25,7 @@
     "sac_lr_alpha": 3e-4,
     "sac_tau": 0.005,
     "sac_batch_size": 256,
-    "sac_buffer_size": 1000000,
+    "sac_buffer_size": 100000,
     "sac_hidden_dim": 256,
     "sac_target_entropy": -2.0,
     "sac_reward_scale": 0.01,

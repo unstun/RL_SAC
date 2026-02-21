@@ -2398,7 +2398,7 @@ def train_one_sac(
         demo_rng = np.random.default_rng(seed + 9999)
         from forest_vehicle_dqn.baselines.mpc_local_planner import MPCConfig
         mpc_cfg = MPCConfig()
-        n_demo_eps = min(200, max(20, bc_pretrain_steps // 25))
+        n_demo_eps = min(50, max(20, bc_pretrain_steps // 100))
         for demo_ep in range(n_demo_eps):
             reset_opts = {
                 "random_start_goal": True,
@@ -3714,7 +3714,8 @@ def main(argv: list[str] | None = None) -> int:
                 action_grid_power=float(args.forest_action_grid_power),
             )
             forest_demo_data = None
-            if bool(args.forest_demo_prefill) and int(args.learning_starts) > 0:
+            has_dqn_algos = any(str(a) != "cnn-sac" for a in args.rl_algos)
+            if has_dqn_algos and bool(args.forest_demo_prefill) and int(args.learning_starts) > 0:
                 demo_target = forest_demo_target(
                     learning_starts=int(args.learning_starts),
                     batch_size=int(agent_cfg.batch_size),
