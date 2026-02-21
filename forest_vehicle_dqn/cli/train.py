@@ -2361,6 +2361,12 @@ def train_one_sac(
     bc_pretrain_steps: int = 0,
     cbf_alpha: float = 0.0,
     cbf_safety_margin_m: float = 0.15,
+    use_tecrl: bool = False,
+    entropy_budget_ratio: float = 0.6,
+    lr_entropy_critic: float = 3e-4,
+    use_syllabus_plr: bool = False,
+    plr_levels_str: str = "6,10,14,20,30,42",
+    plr_staleness_coef: float = 0.3,
     progress: bool = True,
     device: torch.device = torch.device("cpu"),
     flow_log_fp: "TextIO | None" = None,
@@ -2396,9 +2402,23 @@ def train_one_sac(
         target_q_max=float(sac_cfg_dict.get("sac_target_q_max", 50.0)),
         use_huber_loss=bool(sac_cfg_dict.get("sac_use_huber_loss", True)),
         critic_warmup_steps=int(sac_cfg_dict.get("sac_critic_warmup_steps", 2000)),
+        use_tecrl=bool(use_tecrl or sac_cfg_dict.get("sac_use_tecrl", False)),
+        lr_entropy_critic=float(sac_cfg_dict.get("sac_lr_entropy_critic", lr_entropy_critic)),
+        entropy_budget_ratio=float(sac_cfg_dict.get("sac_entropy_budget_ratio", entropy_budget_ratio)),
     )
     agent = SACAgent(sac_config, device=str(device), seed=seed)
     log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
+
+    # --- Syllabus PLR curriculum ---
+    plr_curriculum = None
+    plr_enabled = bool(use_syllabus_plr or sac_cfg_dict.get("use_syllabus_plr", False))
+    if plr_enabled:
+        from forest_vehicle_dqn.plr_curriculum import ForestPLRCurriculum
+        levels_str = str(sac_cfg_dict.get("plr_levels", plr_levels_str))
+        levels = [float(x) for x in levels_str.split(",")]
+        staleness = float(sac_cfg_dict.get("plr_staleness_coef", plr_staleness_coef))
+        plr_curriculum = ForestPLRCurriculum(levels, staleness_coef=staleness, seed=seed)
+        log(f"[train-sac] PLR curriculum enabled: {len(levels)} levels={levels}")
 
     # --- BC pretraining from expert demonstrations ---
     if bc_pretrain_steps > 0:
@@ -2481,6 +2501,18 @@ def train_one_sac(
                 "rand_edge_margin_m": float(forest_rand_edge_margin_m),
             }
 
+        # PLR overrides distance range when enabled
+        plr_level_idx = -1
+        if plr_curriculum is not None:
+            plr_level_idx = plr_curriculum.sample_level()
+            lo, hi = plr_curriculum.level_to_dist_range(plr_level_idx)
+            reset_options["random_start_goal"] = True
+            reset_options["rand_min_dist_m"] = lo
+            reset_options["rand_max_dist_m"] = hi
+            reset_options.setdefault("rand_fixed_prob", float(forest_rand_fixed_prob))
+            reset_options.setdefault("rand_tries", int(forest_rand_tries))
+            reset_options.setdefault("rand_edge_margin_m", float(forest_rand_edge_margin_m))
+
         obs_raw, _ = env.reset(seed=seed + ep, options=reset_options)
         obs = env.observe_sac(map_size=global_map_size)
         done = False
@@ -2524,6 +2556,11 @@ def train_one_sac(
             ep_return += float(reward)
 
         returns[ep] = float(ep_return)
+
+        # PLR: report episode result
+        if plr_curriculum is not None and plr_level_idx >= 0:
+            ep_len = int(env.current_step) if hasattr(env, "current_step") else 1
+            plr_curriculum.report(plr_level_idx, float(ep_return), length=ep_len)
 
         # Collect per-episode stats
         ep_stat = {
@@ -3260,6 +3297,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--forest-reward-k-o", type=float, default=1.5)
     ap.add_argument("--global-map-size", type=int, default=48)
     ap.add_argument("--global-map-channels", type=int, default=3)
+    # v8p3: TECRL + exponential potential + Syllabus PLR
+    ap.add_argument("--sac-use-tecrl", action="store_true", default=False)
+    ap.add_argument("--sac-entropy-budget-ratio", type=float, default=0.6)
+    ap.add_argument("--sac-lr-entropy-critic", type=float, default=3e-4)
+    ap.add_argument("--reward-potential-base", type=float, default=0.0)
+    ap.add_argument("--reward-potential-bias", type=float, default=0.0)
+    ap.add_argument("--use-syllabus-plr", action="store_true", default=False)
+    ap.add_argument("--plr-levels", type=str, default="6,10,14,20,30,42")
+    ap.add_argument("--plr-staleness-coef", type=float, default=0.3)
 
     ap.add_argument(
         "--forest-expert",
@@ -3838,6 +3884,8 @@ def main(argv: list[str] | None = None) -> int:
                 cbf_h_max=float(getattr(args, "forest_cbf_h_max", 2.0)),
                 gamma=float(getattr(args, "gamma", 0.99)),
                 reward_k_o=float(getattr(args, "forest_reward_k_o", 1.5)),
+                reward_potential_base=float(getattr(args, "reward_potential_base", 0.0)),
+                reward_potential_bias=float(getattr(args, "reward_potential_bias", 0.0)),
             )
             forest_demo_data = None
             has_dqn_algos = any(str(a) != "cnn-sac" for a in args.rl_algos)
@@ -3951,6 +3999,18 @@ def main(argv: list[str] | None = None) -> int:
                                                 sac_cfg_raw.get("forest_cbf_alpha", 0.0))),
                         cbf_safety_margin_m=float(getattr(args, "forest_cbf_safety_margin_m",
                                                           sac_cfg_raw.get("forest_cbf_safety_margin_m", 0.15))),
+                        use_tecrl=bool(getattr(args, "sac_use_tecrl",
+                                               sac_cfg_raw.get("sac_use_tecrl", False))),
+                        entropy_budget_ratio=float(getattr(args, "sac_entropy_budget_ratio",
+                                                           sac_cfg_raw.get("sac_entropy_budget_ratio", 0.6))),
+                        lr_entropy_critic=float(getattr(args, "sac_lr_entropy_critic",
+                                                        sac_cfg_raw.get("sac_lr_entropy_critic", 3e-4))),
+                        use_syllabus_plr=bool(getattr(args, "use_syllabus_plr",
+                                                      sac_cfg_raw.get("use_syllabus_plr", False))),
+                        plr_levels_str=str(getattr(args, "plr_levels",
+                                                   sac_cfg_raw.get("plr_levels", "6,10,14,20,30,42"))),
+                        plr_staleness_coef=float(getattr(args, "plr_staleness_coef",
+                                                         sac_cfg_raw.get("plr_staleness_coef", 0.3))),
                         progress=progress,
                         device=device,
                         flow_log_fp=flow_log_fp,
