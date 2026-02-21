@@ -1,6 +1,6 @@
-# 版本留档索引（v1 → v8p2）
+# 版本留档索引（v1 → v8p3）
 
-- 归档入口：仓库根目录 `README.md` 的”版本总索引（v1 → v8p2）”。
+- 归档入口：仓库根目录 `README.md` 的”版本总索引（v1 → v8p3）”。
 - 本文件保留为 `docs/versions/` 内部快速导航，与根 README 保持同一口径。
 - 历史目录 `v3p1`~`v3p11` 保留原始记录，未纳入本轮重编号。
 - 早期误混入版本链已于 2026-02-09 清理，当前主线编号延续至 `v7p2p1`。
@@ -40,6 +40,7 @@
 | `v8` | `docs/versions/v8/` | `configs/v8.json` | `runs/v8-mid3/train_20260221_190531` | `0.0` / `0.0` | `1.0` / `1.0` | 训练发散，SR=0% |
 | `v8p1` | `docs/versions/v8p1/` | `configs/v8.json` | `runs/v8-fix1/train_20260221_212443` | `0.0` / `0.0` | `1.0` / `1.0` | 稳定性修复成功，smoke SR=0%（150ep 不足） |
 | `v8p2` | `docs/versions/v8p2/` | `configs/v8p2.json` | `runs/v8p2-smoke1/train_20260221_224028` | `0.0` / `0.0` | `1.0` / `1.0` | CBF-Safe SAC，smoke SR=0%（150ep），best_return=477.5 |
+| `v8p3` | `docs/versions/v8p3/` | `configs/v8p3.json` | `runs/v8p3-smoke1/train_20260222_011340` | `0.0` / `0.0` | `1.0` / `1.0` | TECRL+ExpPotential+PLR，smoke SR=0%，alpha 崩塌到 0.003 |
 
 ## baseline-only 排除口径
 - 上表“关键 run”仅统计 RL 运行（`skip_rl=false`）。
