@@ -634,6 +634,11 @@ class AMRBicycleEnv(gym.Env):
         action_delta_dot_bins: int = 7,
         action_accel_bins: int = 5,
         action_grid_power: float = 1.0,
+        # CBF-aware reward shaping (v8p2) — set c_prog/c_cbf > 0 to activate.
+        reward_c_prog: float = 0.0,
+        reward_c_cbf: float = 0.0,
+        cbf_h_max: float = 2.0,
+        gamma: float = 0.99,
     ) -> None:
         super().__init__()
 
@@ -772,6 +777,12 @@ class AMRBicycleEnv(gym.Env):
         self.reward_reached = float(reward_reached)
         self.reward_collision = float(reward_collision)
         self.reward_eps = 1e-3
+        # CBF-aware reward shaping (v8p2)
+        self.reward_c_prog = float(reward_c_prog)
+        self.reward_c_cbf = float(reward_c_cbf)
+        self.cbf_h_max = float(cbf_h_max)
+        self._gamma = float(gamma)
+        self._cbf_collision_thr = float(self.footprint.radius_m) + float(self._eps_cell_m)
         self.terminate_on_stuck = bool(terminate_on_stuck)
         self.stuck_steps = int(stuck_steps)
         if self.stuck_steps < 1:
@@ -1326,11 +1337,19 @@ class AMRBicycleEnv(gym.Env):
                         terminated = True
 
         reward = 0.0
-        # Progress (short)
-        if math.isfinite(dist_before) and math.isfinite(dist_after):
-            reward += self.reward_k_p * float(dist_before - dist_after)
+        # Progress reward
+        if self.reward_c_prog > 0.0:
+            # Potential-based shaping: c_prog * (dist_k - γ * dist_{k+1})
+            if math.isfinite(dist_before) and math.isfinite(dist_after):
+                reward += self.reward_c_prog * (float(dist_before) - self._gamma * float(dist_after))
+            else:
+                reward += self.reward_c_prog * (float(d_goal_before) - self._gamma * float(d_goal_after))
         else:
-            reward += self.reward_k_p * float(d_goal_before - d_goal_after)
+            # Legacy k_p progress reward
+            if math.isfinite(dist_before) and math.isfinite(dist_after):
+                reward += self.reward_k_p * float(dist_before - dist_after)
+            else:
+                reward += self.reward_k_p * float(d_goal_before - d_goal_after)
         # Time (fast): per-step penalty.
         reward -= self.reward_k_t
         if (not collision) and (not reached):
@@ -1355,11 +1374,17 @@ class AMRBicycleEnv(gym.Env):
         if not collision:
             od_pos = max(0.0, float(od_m))
 
-            # Near-obstacle penalty (using OD).
-            if od_pos < self.safe_distance_m:
-                obs_term = (1.0 / (od_pos + self.reward_eps)) - (1.0 / (self.safe_distance_m + self.reward_eps))
-                obs_pen = float(self.reward_k_o) * float(obs_term)
-                reward -= min(float(self.reward_obs_max), float(obs_pen))
+            if self.reward_c_cbf > 0.0:
+                # CBF log-barrier reward: c_cbf * log(max(h / h_max, eps))
+                h_val = float(od_m)  # od_m already = min_od - collision_thr
+                h_ratio = max(float(h_val) / float(self.cbf_h_max), 1e-6)
+                reward += self.reward_c_cbf * float(math.log(h_ratio))
+            else:
+                # Legacy k_o near-obstacle penalty (using OD).
+                if od_pos < self.safe_distance_m:
+                    obs_term = (1.0 / (od_pos + self.reward_eps)) - (1.0 / (self.safe_distance_m + self.reward_eps))
+                    obs_pen = float(self.reward_k_o) * float(obs_term)
+                    reward -= min(float(self.reward_obs_max), float(obs_pen))
 
             # Forest near-obstacle speed coupling + optional soft speed cap.
             if od_pos < self.safe_speed_distance_m:
