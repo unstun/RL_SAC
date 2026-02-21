@@ -639,6 +639,9 @@ class AMRBicycleEnv(gym.Env):
         reward_c_cbf: float = 0.0,
         cbf_h_max: float = 2.0,
         gamma: float = 0.99,
+        # Exponential potential-based shaping (v8p3)
+        reward_potential_base: float = 0.0,
+        reward_potential_bias: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -782,6 +785,9 @@ class AMRBicycleEnv(gym.Env):
         self.reward_c_cbf = float(reward_c_cbf)
         self.cbf_h_max = float(cbf_h_max)
         self._gamma = float(gamma)
+        self.reward_potential_base = float(reward_potential_base)
+        self.reward_potential_bias = float(reward_potential_bias)
+        self._initial_dist = None  # set in reset()
         self._cbf_collision_thr = float(self.footprint.radius_m) + float(self._eps_cell_m)
         self.terminate_on_stuck = bool(terminate_on_stuck)
         self.stuck_steps = int(stuck_steps)
@@ -1247,6 +1253,9 @@ class AMRBicycleEnv(gym.Env):
         self._astar_start_xy = (int(ha_start_xy[0]), int(ha_start_xy[1]))
         self._astar_progress_idx = 0
 
+        # Record initial distance for exponential potential shaping (v8p3)
+        self._initial_dist = self._distance_to_goal_m()
+
         obs = self._observe()
         info = {"agent_xy": self._agent_xy_for_plot(), "pose_m": (self._x_m, self._y_m, self._psi_rad)}
         return obs, info
@@ -1339,11 +1348,24 @@ class AMRBicycleEnv(gym.Env):
         reward = 0.0
         # Progress reward
         if self.reward_c_prog > 0.0:
-            # Potential-based shaping: c_prog * (dist_k - γ * dist_{k+1})
-            if math.isfinite(dist_before) and math.isfinite(dist_after):
-                reward += self.reward_c_prog * (float(dist_before) - self._gamma * float(dist_after))
+            if self.reward_potential_base > 0.0 and self._initial_dist and self._initial_dist > 0:
+                # Exponential potential-based shaping (v8p3)
+                base = self.reward_potential_base
+                bias = self.reward_potential_bias
+                d_now = float(dist_after) if math.isfinite(dist_after) else float(d_goal_after)
+                d_prev = float(dist_before) if math.isfinite(dist_before) else float(d_goal_before)
+                prog_now = max(0.0, min(1.0, 1.0 - d_now / self._initial_dist))
+                prog_prev = max(0.0, min(1.0, 1.0 - d_prev / self._initial_dist))
+                phi_now = math.exp(base * prog_now)
+                phi_prev = math.exp(base * prog_prev)
+                reward += self.reward_c_prog * (
+                    (phi_now + bias) - self._gamma * (phi_prev + bias))
             else:
-                reward += self.reward_c_prog * (float(d_goal_before) - self._gamma * float(d_goal_after))
+                # Linear potential-based shaping (v8p2)
+                if math.isfinite(dist_before) and math.isfinite(dist_after):
+                    reward += self.reward_c_prog * (float(dist_before) - self._gamma * float(dist_after))
+                else:
+                    reward += self.reward_c_prog * (float(d_goal_before) - self._gamma * float(d_goal_after))
         else:
             # Legacy k_p progress reward
             if math.isfinite(dist_before) and math.isfinite(dist_after):
