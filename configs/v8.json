@@ -28,6 +28,8 @@
     "sac_buffer_size": 1000000,
     "sac_hidden_dim": 256,
     "sac_target_entropy": -2.0,
+    "sac_reward_scale": 0.01,
+    "sac_grad_clip_norm": 1.0,
     "sac_bc_pretrain_steps": 5000,
     "global_map_size": 48,
     "global_map_channels": 3,

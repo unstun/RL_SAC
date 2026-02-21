@@ -1934,6 +1934,46 @@ class AMRBicycleEnv(gym.Env):
         best = int(np.argmin(d2))
         return int(best)
 
+    def expert_continuous_action_hybrid_astar_mpc(
+        self,
+        *,
+        mpc_cfg,
+    ) -> np.ndarray:
+        """Like expert_action_hybrid_astar_mpc but returns continuous action in [-1, 1]."""
+        from forest_vehicle_dqn.baselines.mpc_local_planner import solve_mpc_one_step
+
+        path = self._hybrid_astar_path(start_xy=self._ha_start_xy)
+        if len(path) < 2:
+            return np.zeros(2, dtype=np.float32)
+
+        cell_size_m = float(self.cell_size_m)
+        path_xy_m = np.asarray([(float(x) * cell_size_m, float(y) * cell_size_m) for x, y in path], dtype=np.float64)
+        path_theta = np.zeros((int(path_xy_m.shape[0]),), dtype=np.float64)
+        if int(path_xy_m.shape[0]) >= 2:
+            dxy = np.diff(path_xy_m, axis=0)
+            seg_h = np.arctan2(dxy[:, 1], dxy[:, 0]).astype(np.float64, copy=False)
+            path_theta[:-1] = seg_h
+            path_theta[-1] = seg_h[-1]
+
+        step = solve_mpc_one_step(
+            env=self,
+            path_xy_m=path_xy_m,
+            path_theta=path_theta,
+            prev_path_idx=int(self._ha_progress_idx),
+            config=mpc_cfg,
+        )
+        self._ha_progress_idx = int(step.nearest_path_idx)
+
+        if not bool(step.feasible):
+            return np.zeros(2, dtype=np.float32)
+
+        dd_max = float(self.model.delta_dot_max_rad_s)
+        a_max = float(self.model.a_max_m_s2)
+        return np.array([
+            float(np.clip(float(step.delta_dot_rad_s) / dd_max, -1.0, 1.0)),
+            float(np.clip(float(step.a_m_s2) / a_max, -1.0, 1.0)),
+        ], dtype=np.float32)
+
 
     def expert_action_hybrid_astar(
         self,

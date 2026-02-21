@@ -30,6 +30,8 @@ class SACConfig:
     batch_size: int = 256
     buffer_size: int = 1_000_000
     target_entropy: float = -2.0  # -dim(action)
+    reward_scale: float = 0.01  # scale raw rewards to stabilize Q-values
+    grad_clip_norm: float = 1.0  # max gradient norm for critic/actor
 
 
 class SACReplayBuffer:
@@ -144,6 +146,7 @@ class SACAgent:
         scalars_t = torch.as_tensor(scalars, device=self.device)
         actions_t = torch.as_tensor(actions, device=self.device)
         rewards_t = torch.as_tensor(rewards, device=self.device).unsqueeze(1)
+        rewards_t = rewards_t * self.cfg.reward_scale  # scale rewards
         n_maps_t = torch.as_tensor(n_maps, device=self.device)
         n_scalars_t = torch.as_tensor(n_scalars, device=self.device)
         dones_t = torch.as_tensor(dones, device=self.device).unsqueeze(1)
@@ -162,6 +165,8 @@ class SACAgent:
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), self.cfg.grad_clip_norm)
         self.critic_opt.step()
 
         # --- Actor update ---
@@ -172,6 +177,8 @@ class SACAgent:
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), self.cfg.grad_clip_norm)
         self.actor_opt.step()
 
         # --- Alpha update ---

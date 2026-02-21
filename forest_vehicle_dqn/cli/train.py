@@ -2385,9 +2385,50 @@ def train_one_sac(
         batch_size=int(sac_cfg_dict.get("sac_batch_size", 256)),
         buffer_size=int(sac_cfg_dict.get("sac_buffer_size", 1_000_000)),
         target_entropy=float(sac_cfg_dict.get("sac_target_entropy", -2.0)),
+        reward_scale=float(sac_cfg_dict.get("sac_reward_scale", 0.01)),
+        grad_clip_norm=float(sac_cfg_dict.get("sac_grad_clip_norm", 1.0)),
     )
     agent = SACAgent(sac_config, device=str(device), seed=seed)
     log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
+
+    # --- BC pretraining from expert demonstrations ---
+    if bc_pretrain_steps > 0:
+        log(f"[train-sac] Collecting expert demos for BC pretraining...")
+        demos = []
+        demo_rng = np.random.default_rng(seed + 9999)
+        from forest_vehicle_dqn.baselines.mpc_local_planner import MPCConfig
+        mpc_cfg = MPCConfig()
+        n_demo_eps = min(200, max(20, bc_pretrain_steps // 25))
+        for demo_ep in range(n_demo_eps):
+            reset_opts = {
+                "random_start_goal": True,
+                "rand_min_dist_m": float(forest_rand_min_dist_m),
+                "rand_max_dist_m": 0.0 if forest_rand_max_dist_m is None else float(forest_rand_max_dist_m),
+                "rand_fixed_prob": float(forest_rand_fixed_prob),
+                "rand_tries": int(forest_rand_tries),
+                "rand_edge_margin_m": float(forest_rand_edge_margin_m),
+            }
+            try:
+                env.reset(seed=int(demo_rng.integers(0, 2**31)), options=reset_opts)
+            except Exception:
+                continue
+            for _ in range(env.max_steps):
+                obs_d = env.observe_sac(map_size=global_map_size)
+                try:
+                    action = env.expert_continuous_action_hybrid_astar_mpc(mpc_cfg=mpc_cfg)
+                except Exception:
+                    break
+                demos.append({"maps": obs_d["maps"], "scalars": obs_d["scalars"], "action": action})
+                delta_dot = float(action[0]) * float(env.model.delta_dot_max_rad_s)
+                accel = float(action[1]) * float(env.model.a_max_m_s2)
+                _, _, done, truncated, _ = env.step_continuous(
+                    delta_dot_rad_s=delta_dot, a_m_s2=accel)
+                if done or truncated:
+                    break
+        log(f"[train-sac] Collected {len(demos)} expert transitions from {n_demo_eps} episodes")
+        if demos:
+            agent.pretrain_bc(demos, steps=bc_pretrain_steps)
+            log(f"[train-sac] BC pretraining done: {bc_pretrain_steps} steps")
 
     returns = np.zeros((episodes,), dtype=np.float32)
     global_step = 0
@@ -2451,6 +2492,7 @@ def train_one_sac(
 
         if ep_return > best_return:
             best_return = ep_return
+            best_state = True
             model_dir = out_dir / "models" / str(env.map_spec.name)
             model_dir.mkdir(parents=True, exist_ok=True)
             agent.save(model_dir / "cnn-sac.pt")
@@ -2465,10 +2507,13 @@ def train_one_sac(
                 f"best={best_return:.1f}, alpha={agent.alpha:.3f}, "
                 f"elapsed={elapsed:.0f}s")
 
-    # Final save
+    # Final save (only if no best was saved, or save as separate file)
     model_dir = out_dir / "models" / str(env.map_spec.name)
     model_dir.mkdir(parents=True, exist_ok=True)
-    agent.save(model_dir / "cnn-sac.pt")
+    agent.save(model_dir / "cnn-sac-final.pt")
+    if best_state is None:
+        # No best was saved during training, use final
+        agent.save(model_dir / "cnn-sac.pt")
     log(f"[train-sac] Done: {episodes} episodes, best_return={best_return:.1f}")
 
     return agent, returns, [], {"meta": {"algo": "cnn-sac", "episodes": episodes}}
@@ -3089,6 +3134,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sac-buffer-size", type=int, default=1_000_000)
     ap.add_argument("--sac-hidden-dim", type=int, default=256)
     ap.add_argument("--sac-target-entropy", type=float, default=-2.0)
+    ap.add_argument("--sac-reward-scale", type=float, default=0.01)
+    ap.add_argument("--sac-grad-clip-norm", type=float, default=1.0)
     ap.add_argument("--sac-bc-pretrain-steps", type=int, default=0)
     ap.add_argument("--global-map-size", type=int, default=48)
     ap.add_argument("--global-map-channels", type=int, default=3)
