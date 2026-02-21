@@ -168,6 +168,8 @@ class SACAgent:
             next_obs["maps"], next_obs["scalars"], done)
 
     def update(self) -> Dict[str, float]:
+        if self.use_tecrl:
+            return self.update_tecrl()
         if self.buffer.size < self.cfg.batch_size:
             return {}
         maps, scalars, actions, rewards, n_maps, n_scalars, dones = \
@@ -241,6 +243,115 @@ class SACAgent:
             "q2_mean": q2.mean().item(),
             "target_q_mean": target_q.mean().item(),
             "target_q_max": target_q.max().item(),
+            "reward_batch_mean": rewards_t.mean().item(),
+        }
+
+    def update_tecrl(self) -> Dict[str, float]:
+        """TECRL update: separate reward-critic and entropy-critic."""
+        if self.buffer.size < self.cfg.batch_size:
+            return {}
+        maps, scalars, actions, rewards, n_maps, n_scalars, dones = \
+            self.buffer.sample(self.cfg.batch_size, self._rng)
+
+        maps_t = torch.as_tensor(maps, device=self.device)
+        scalars_t = torch.as_tensor(scalars, device=self.device)
+        actions_t = torch.as_tensor(actions, device=self.device)
+        rewards_t = torch.as_tensor(rewards, device=self.device).unsqueeze(1)
+        rewards_t = rewards_t * self.cfg.reward_scale
+        n_maps_t = torch.as_tensor(n_maps, device=self.device)
+        n_scalars_t = torch.as_tensor(n_scalars, device=self.device)
+        dones_t = torch.as_tensor(dones, device=self.device).unsqueeze(1)
+        gamma = self.cfg.gamma
+        alpha = self.log_alpha.exp().detach()
+
+        # --- 1. Reward critic update (no alpha in target) ---
+        with torch.no_grad():
+            n_action, n_log_prob = self.actor.sample(n_maps_t, n_scalars_t)
+            tq1_r, tq2_r = self.critic_target(
+                n_maps_t, n_scalars_t, n_action)
+            target_q_r = rewards_t + (1 - dones_t) * gamma * torch.min(
+                tq1_r, tq2_r)
+            target_q_r = target_q_r.clamp(
+                self.cfg.target_q_min, self.cfg.target_q_max)
+
+        q1_r, q2_r = self.critic(maps_t, scalars_t, actions_t)
+        if self.cfg.use_huber_loss:
+            critic_loss = (F.smooth_l1_loss(q1_r, target_q_r)
+                           + F.smooth_l1_loss(q2_r, target_q_r))
+        else:
+            critic_loss = (F.mse_loss(q1_r, target_q_r)
+                           + F.mse_loss(q2_r, target_q_r))
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), self.cfg.grad_clip_norm)
+        self.critic_opt.step()
+
+        # --- 2. Entropy critic update (target = -log_prob + γ Q_e) ---
+        with torch.no_grad():
+            tq1_e, tq2_e = self.entropy_critic_target(
+                n_maps_t, n_scalars_t, n_action)
+            target_q_e = (-n_log_prob.unsqueeze(1)
+                          + (1 - dones_t) * gamma * torch.min(tq1_e, tq2_e))
+
+        q1_e, q2_e = self.entropy_critic(maps_t, scalars_t, actions_t)
+        if self.cfg.use_huber_loss:
+            ent_critic_loss = (F.smooth_l1_loss(q1_e, target_q_e)
+                               + F.smooth_l1_loss(q2_e, target_q_e))
+        else:
+            ent_critic_loss = (F.mse_loss(q1_e, target_q_e)
+                               + F.mse_loss(q2_e, target_q_e))
+        self.entropy_critic_opt.zero_grad()
+        ent_critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.entropy_critic.parameters(), self.cfg.grad_clip_norm)
+        self.entropy_critic_opt.step()
+
+        # --- 3. Actor update: maximize Q_r + α * Q_e ---
+        new_action, log_prob = self.actor.sample(maps_t, scalars_t)
+        q1_r_new, q2_r_new = self.critic(maps_t, scalars_t, new_action)
+        q_r_new = torch.min(q1_r_new, q2_r_new)
+        q1_e_new, q2_e_new = self.entropy_critic(
+            maps_t, scalars_t, new_action)
+        q_e_new = torch.min(q1_e_new, q2_e_new)
+        actor_loss = (-q_r_new - alpha * q_e_new).mean()
+
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), self.cfg.grad_clip_norm)
+        self.actor_opt.step()
+
+        # --- 4. Alpha update: trajectory entropy constraint ---
+        alpha_loss = -(self.log_alpha * (
+            q_e_new.detach() + log_prob.detach().unsqueeze(1)
+            - self.entropy_budget)).mean()
+        self.alpha_opt.zero_grad()
+        alpha_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [self.log_alpha], self.cfg.grad_clip_norm)
+        self.alpha_opt.step()
+
+        # --- 5. Soft target update (both critics) ---
+        with torch.no_grad():
+            for tp, p in zip(self.critic_target.parameters(),
+                             self.critic.parameters()):
+                tp.data.mul_(1 - self.cfg.tau).add_(
+                    p.data, alpha=self.cfg.tau)
+            for tp, p in zip(self.entropy_critic_target.parameters(),
+                             self.entropy_critic.parameters()):
+                tp.data.mul_(1 - self.cfg.tau).add_(
+                    p.data, alpha=self.cfg.tau)
+
+        return {
+            "critic_loss": critic_loss.item(),
+            "ent_critic_loss": ent_critic_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "alpha": self.alpha,
+            "q1_mean": q1_r.mean().item(),
+            "q2_mean": q2_r.mean().item(),
+            "q_e_mean": q_e_new.mean().item(),
+            "target_q_r_mean": target_q_r.mean().item(),
             "reward_batch_mean": rewards_t.mean().item(),
         }
 
@@ -319,7 +430,7 @@ class SACAgent:
     def save(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        state = {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "critic_target": self.critic_target.state_dict(),
@@ -327,7 +438,14 @@ class SACAgent:
             "actor_opt": self.actor_opt.state_dict(),
             "critic_opt": self.critic_opt.state_dict(),
             "alpha_opt": self.alpha_opt.state_dict(),
-        }, path)
+        }
+        if self.use_tecrl:
+            state["entropy_critic"] = self.entropy_critic.state_dict()
+            state["entropy_critic_target"] = \
+                self.entropy_critic_target.state_dict()
+            state["entropy_critic_opt"] = \
+                self.entropy_critic_opt.state_dict()
+        torch.save(state, path)
 
     def load(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
@@ -338,3 +456,9 @@ class SACAgent:
         self.actor_opt.load_state_dict(ckpt["actor_opt"])
         self.critic_opt.load_state_dict(ckpt["critic_opt"])
         self.alpha_opt.load_state_dict(ckpt["alpha_opt"])
+        if self.use_tecrl and "entropy_critic" in ckpt:
+            self.entropy_critic.load_state_dict(ckpt["entropy_critic"])
+            self.entropy_critic_target.load_state_dict(
+                ckpt["entropy_critic_target"])
+            self.entropy_critic_opt.load_state_dict(
+                ckpt["entropy_critic_opt"])
