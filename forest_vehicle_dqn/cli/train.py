@@ -2359,13 +2359,16 @@ def train_one_sac(
     forest_train_long_min_dist_m: float = 14.0,
     forest_train_long_max_dist_m: float | None = None,
     bc_pretrain_steps: int = 0,
+    cbf_alpha: float = 0.0,
+    cbf_safety_margin_m: float = 0.15,
     progress: bool = True,
     device: torch.device = torch.device("cpu"),
+    flow_log_fp: "TextIO | None" = None,
 ) -> tuple[object, np.ndarray, list, dict]:
     """Simplified SAC training loop for continuous-action forest navigation."""
     from forest_vehicle_dqn.sac_agent import SACAgent, SACConfig
 
-    progress_write = make_progress_writer(progress)
+    progress_write = make_progress_writer(progress, flow_log_fp=flow_log_fp)
 
     def log(msg: str) -> None:
         if progress_write is not None:
@@ -2387,6 +2390,12 @@ def train_one_sac(
         target_entropy=float(sac_cfg_dict.get("sac_target_entropy", -2.0)),
         reward_scale=float(sac_cfg_dict.get("sac_reward_scale", 0.01)),
         grad_clip_norm=float(sac_cfg_dict.get("sac_grad_clip_norm", 1.0)),
+        reward_clip_min=float(sac_cfg_dict.get("sac_reward_clip_min", -500.0)),
+        reward_clip_max=float(sac_cfg_dict.get("sac_reward_clip_max", 1100.0)),
+        target_q_min=float(sac_cfg_dict.get("sac_target_q_min", -50.0)),
+        target_q_max=float(sac_cfg_dict.get("sac_target_q_max", 50.0)),
+        use_huber_loss=bool(sac_cfg_dict.get("sac_use_huber_loss", True)),
+        critic_warmup_steps=int(sac_cfg_dict.get("sac_critic_warmup_steps", 2000)),
     )
     agent = SACAgent(sac_config, device=str(device), seed=seed)
     log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
@@ -2430,10 +2439,17 @@ def train_one_sac(
             agent.pretrain_bc(demos, steps=bc_pretrain_steps)
             log(f"[train-sac] BC pretraining done: {bc_pretrain_steps} steps")
 
+    cbf_enabled = float(cbf_alpha) > 0.0
+    cbf_interventions = 0
+
     returns = np.zeros((episodes,), dtype=np.float32)
+    eval_returns = np.full((episodes,), float("nan"), dtype=np.float32)
+    ep_stats_list: list[dict] = []  # per-episode stats for CSV
     global_step = 0
     best_return = float("-inf")
     best_state = None
+    critic_warmed_up = False
+    eval_interval = int(sac_cfg_dict.get("sac_eval_interval", 50))
     t_start = time.perf_counter()
 
     try:
@@ -2475,20 +2491,91 @@ def train_one_sac(
             global_step += 1
             action = agent.act(obs, explore=True)
             # Map [-1,1] to physical controls
-            delta_dot = float(action[0]) * float(env.model.delta_dot_max_rad_s)
-            accel = float(action[1]) * float(env.model.a_max_m_s2)
+            act_dd = float(action[0])
+            act_a = float(action[1])
+            # CBF safety filter
+            if cbf_enabled:
+                act_dd, act_a, cbf_info = env.cbf_safe_action(
+                    act_dd, act_a,
+                    alpha_cbf=float(cbf_alpha),
+                    safety_margin=float(cbf_safety_margin_m),
+                )
+                if cbf_info["cbf_intervened"]:
+                    cbf_interventions += 1
+            delta_dot = act_dd * float(env.model.delta_dot_max_rad_s)
+            accel = act_a * float(env.model.a_max_m_s2)
             _, reward, done, truncated, info = env.step_continuous(
                 delta_dot_rad_s=delta_dot, a_m_s2=accel)
             next_obs = env.observe_sac(map_size=global_map_size)
             agent.observe(obs, action, float(reward), next_obs, bool(done))
 
             if global_step >= learning_starts:
-                agent.update()
+                # Critic warmup: critic-only updates before first actor update
+                if not critic_warmed_up and sac_config.critic_warmup_steps > 0:
+                    log(f"[train-sac] Critic warmup: {sac_config.critic_warmup_steps} steps...")
+                    agent.warmup_critic(sac_config.critic_warmup_steps)
+                    log("[train-sac] Critic warmup done")
+                    critic_warmed_up = True
+                update_info = agent.update()
+            else:
+                update_info = {}
 
             obs = next_obs
             ep_return += float(reward)
 
         returns[ep] = float(ep_return)
+
+        # Collect per-episode stats
+        ep_stat = {
+            "episode": ep + 1,
+            "return": float(ep_return),
+            "eval_return": float("nan"),
+            "critic_loss": update_info.get("critic_loss", float("nan")),
+            "actor_loss": update_info.get("actor_loss", float("nan")),
+            "alpha": update_info.get("alpha", float("nan")),
+            "q1_mean": update_info.get("q1_mean", float("nan")),
+            "target_q_mean": update_info.get("target_q_mean", float("nan")),
+            "target_q_max": update_info.get("target_q_max", float("nan")),
+            "cbf_interventions": cbf_interventions,
+        }
+
+        # --- Periodic deterministic evaluation ---
+        if eval_interval > 0 and (ep + 1) % eval_interval == 0:
+            eval_reset_opts = {
+                "random_start_goal": True,
+                "rand_min_dist_m": float(forest_rand_min_dist_m),
+                "rand_max_dist_m": 0.0 if forest_rand_max_dist_m is None else float(forest_rand_max_dist_m),
+                "rand_fixed_prob": 0.0,
+                "rand_tries": int(forest_rand_tries),
+                "rand_edge_margin_m": float(forest_rand_edge_margin_m),
+            }
+            try:
+                env.reset(seed=seed + episodes + ep, options=eval_reset_opts)
+                eval_obs = env.observe_sac(map_size=global_map_size)
+                eval_done, eval_trunc, eval_ret = False, False, 0.0
+                while not (eval_done or eval_trunc):
+                    eval_action = agent.act(eval_obs, explore=False)
+                    eval_dd = float(eval_action[0])
+                    eval_acc = float(eval_action[1])
+                    if cbf_enabled:
+                        eval_dd, eval_acc, _ = env.cbf_safe_action(
+                            eval_dd, eval_acc,
+                            alpha_cbf=float(cbf_alpha),
+                            safety_margin=float(cbf_safety_margin_m),
+                        )
+                    d_dot = eval_dd * float(env.model.delta_dot_max_rad_s)
+                    acc = eval_acc * float(env.model.a_max_m_s2)
+                    _, eval_r, eval_done, eval_trunc, _ = env.step_continuous(
+                        delta_dot_rad_s=d_dot, a_m_s2=acc)
+                    eval_obs = env.observe_sac(map_size=global_map_size)
+                    eval_ret += float(eval_r)
+                eval_returns[ep] = float(eval_ret)
+                ep_stat["eval_return"] = float(eval_ret)
+                log(f"[train-sac] EVAL ep={ep+1}: eval_return={eval_ret:.1f}")
+            except Exception:
+                pass  # eval failure is non-fatal
+
+        ep_stats_list.append(ep_stat)
 
         if ep_return > best_return:
             best_return = ep_return
@@ -2499,12 +2586,16 @@ def train_one_sac(
 
         if hasattr(pbar, "set_postfix"):
             pbar.set_postfix(ret=f"{ep_return:.1f}", best=f"{best_return:.1f}",
-                             steps=global_step, alpha=f"{agent.alpha:.3f}")
+                             steps=global_step, alpha=f"{agent.alpha:.3f}",
+                             q1=f"{update_info.get('q1_mean', 0):.2f}")
 
         if (ep + 1) % max(1, episodes // 20) == 0 or ep == 0 or ep == episodes - 1:
             elapsed = time.perf_counter() - t_start
             log(f"[train-sac] ep={ep+1}/{episodes}, ret={ep_return:.1f}, "
                 f"best={best_return:.1f}, alpha={agent.alpha:.3f}, "
+                f"q1={update_info.get('q1_mean', 0):.2f}, "
+                f"tq={update_info.get('target_q_mean', 0):.2f}, "
+                f"cbf={cbf_interventions}, "
                 f"elapsed={elapsed:.0f}s")
 
     # Final save (only if no best was saved, or save as separate file)
@@ -2515,6 +2606,19 @@ def train_one_sac(
         # No best was saved during training, use final
         agent.save(model_dir / "cnn-sac.pt")
     log(f"[train-sac] Done: {episodes} episodes, best_return={best_return:.1f}")
+
+    # Write enhanced training CSV
+    import csv
+    csv_path = out_dir / "training_stats.csv"
+    csv_fields = ["episode", "return", "eval_return", "critic_loss",
+                  "actor_loss", "alpha", "q1_mean", "target_q_mean",
+                  "target_q_max", "cbf_interventions"]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        for row in ep_stats_list:
+            writer.writerow(row)
+    log(f"[train-sac] Saved training CSV: {csv_path}")
 
     return agent, returns, [], {"meta": {"algo": "cnn-sac", "episodes": episodes}}
 
@@ -3137,6 +3241,23 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sac-reward-scale", type=float, default=0.01)
     ap.add_argument("--sac-grad-clip-norm", type=float, default=1.0)
     ap.add_argument("--sac-bc-pretrain-steps", type=int, default=0)
+    ap.add_argument("--sac-reward-clip-min", type=float, default=-500.0)
+    ap.add_argument("--sac-reward-clip-max", type=float, default=1100.0)
+    ap.add_argument("--sac-target-q-min", type=float, default=-50.0)
+    ap.add_argument("--sac-target-q-max", type=float, default=50.0)
+    ap.add_argument("--sac-use-huber-loss", type=bool, default=True)
+    ap.add_argument("--sac-critic-warmup-steps", type=int, default=2000)
+    ap.add_argument("--sac-eval-interval", type=int, default=50)
+    # CBF safety filter + reward shaping (v8p2)
+    ap.add_argument("--forest-cbf-alpha", type=float, default=0.0,
+                     help="CBF decay rate (0=disabled). Set >0 to enable CBF filter.")
+    ap.add_argument("--forest-cbf-safety-margin-m", type=float, default=0.15)
+    ap.add_argument("--forest-reward-c-prog", type=float, default=0.0,
+                     help="Potential-based progress reward coeff (0=use legacy k_p).")
+    ap.add_argument("--forest-reward-c-cbf", type=float, default=0.0,
+                     help="CBF log-barrier reward coeff (0=use legacy k_o).")
+    ap.add_argument("--forest-cbf-h-max", type=float, default=2.0)
+    ap.add_argument("--forest-reward-k-o", type=float, default=1.5)
     ap.add_argument("--global-map-size", type=int, default=48)
     ap.add_argument("--global-map-channels", type=int, default=3)
 
@@ -3712,6 +3833,11 @@ def main(argv: list[str] | None = None) -> int:
                 action_delta_dot_bins=int(args.forest_action_delta_dot_bins),
                 action_accel_bins=int(args.forest_action_accel_bins),
                 action_grid_power=float(args.forest_action_grid_power),
+                reward_c_prog=float(getattr(args, "forest_reward_c_prog", 0.0)),
+                reward_c_cbf=float(getattr(args, "forest_reward_c_cbf", 0.0)),
+                cbf_h_max=float(getattr(args, "forest_cbf_h_max", 2.0)),
+                gamma=float(getattr(args, "gamma", 0.99)),
+                reward_k_o=float(getattr(args, "forest_reward_k_o", 1.5)),
             )
             forest_demo_data = None
             has_dqn_algos = any(str(a) != "cnn-sac" for a in args.rl_algos)
@@ -3821,8 +3947,13 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                         bc_pretrain_steps=int(getattr(args, "sac_bc_pretrain_steps",
                                                       sac_cfg_raw.get("sac_bc_pretrain_steps", 0))),
+                        cbf_alpha=float(getattr(args, "forest_cbf_alpha",
+                                                sac_cfg_raw.get("forest_cbf_alpha", 0.0))),
+                        cbf_safety_margin_m=float(getattr(args, "forest_cbf_safety_margin_m",
+                                                          sac_cfg_raw.get("forest_cbf_safety_margin_m", 0.15))),
                         progress=progress,
                         device=device,
+                        flow_log_fp=flow_log_fp,
                     )
                 except Exception:
                     import traceback
