@@ -360,6 +360,8 @@ class SACAgent:
             "q2_mean": q2_r.mean().item(),
             "q_e_mean": q_e_new.mean().item(),
             "target_q_r_mean": target_q_r.mean().item(),
+            "target_q_mean": target_q_r.mean().item(),  # 兼容日志
+            "target_q_max": target_q_r.max().item(),     # 兼容日志
             "reward_batch_mean": rewards_t.mean().item(),
         }
 
