@@ -48,8 +48,6 @@
 8) **仓库研究目标**
 
    - 最终目标：在森林场景车辆运动规划任务中，提出可复现、可验证的强化学习方法；在统一评测口径下相对多类基线（强化学习基线、传统规划+MPC 基线）达到更优综合性能，重点指标为 `success_rate`（越大越好）、`avg_path_length`（越小越好）、`path_time_s`（越小越好）。
-   - 当前主线：`v7p1`（CNN-DDQN 稳定基线，short/long SR=100%）；SAC 迁移分支已推进到 `v8p2`（CBF-Safe SAC），当前 smoke SR=0% 但训练信号正向（best_return=477.5）。
-   - 当前状态：最终目标尚未达成；`v7p1` 为 CNN-DDQN 阶段性最优结果。SAC 迁移链：`v8`（训练发散）→ `v8p1`（稳定性修复）→ `v8p2`（CBF 安全过滤 + 奖励塑形），下一步为 `v8p3`（课程学习 + alpha 下界）。
    - 方法边界：不限制于 `CNN-DDQN`；允许新增/替换模块或引入其他强化学习算法，但必须满足学术定义合规、可复现留档与门槛验证要求（见第 9、13、16 条）。
 9) **学术定义合规（硬约束）**
 
@@ -76,6 +74,14 @@
 - 每次远端运行前，必须先执行“本地仓库 -> 远端仓库”同步；此处同步口径固定为本地覆盖远端（不包含 `runs/`）。
 - 远端运行完成后，必须将远端 `runs/` 对应结果目录回传到本地 `runs/`，再进行后续分析与归档。
 
+12.1.1) **远端 SSH 执行注意事项（已踩坑）**
+
+- `conda run` 不会自动 cd 到项目目录，必须使用 `conda run --cwd <项目绝对路径>` 指定工作目录。
+  - 正确：`ssh ubuntu-zt "conda run --cwd /home/sun/phdproject/dqn/RL_sac -n ros2py310 python train.py ..."`
+  - 错误：`ssh ubuntu-zt "conda run -n ros2py310 python train.py ..."`（会在 `~` 下找不到 `train.py`）
+- 远端 `~/.bashrc` 的 conda init 块必须放在 interactive guard（`case $- in`）之前，否则 SSH 非交互式命令无法找到 conda。
+  - 已于 2026-02-21 修复本地与远端（ubuntu-zt）的 `~/.bashrc`，备份为 `~/.bashrc.bak.*`。
+
 12.2) **版本标准工作流（默认）**
 
 - 每次创建新版本（`vxpx`）前，必须先完成 GitHub 快照：`git status` clean、`git add/commit`、`git push` 成功。
@@ -97,14 +103,6 @@
   - `path_time_s(SAC-GlobalCNN) < path_time_s(Hybrid A*-MPC)`
 - 若任一套件未满足上述三条，视为未通过最终门槛。
 
-14) **推理期策略口径（命名必须一致）**
-
-- 本仓库允许在**推理阶段**使用 `admissible-action masking`、安全过滤、`top-k` 重选、`stop override`、replacement、fallback、规划器（如 A*/MPC）接管（takeover）等混合策略，以提升成功率与安全性。
-- 但必须显式区分并正确命名（论文/文档/版本留档必须与实现一致）：
-  - `strict`（兼容旧口径 `strict-argmax` / strict no-fallback）：推理阶段必须使用模型原生直接输出动作（DQN 为 `argmax(Q)`，SAC 为确定性策略输出）；允许计算 mask 仅用于统计/诊断，但不得影响最终动作。
-  - `shielded` / `masked` / `hybrid`：推理期允许上述干预（masking/top-k/override/replacement/fallback/takeover 等）；此时不得宣称 `strict-argmax` 或 strict no-fallback。
-- 训练期仍可使用合法数据筛选、课程、辅助损失；若推理期启用干预，必须在配置与版本四件套中写清楚具体策略与开关。
-
 15) **版本命名与留档（硬约束）**
 
 - 版本命名统一采用 `vxpx`：**大改动**执行 `v+1`；**小改动**执行 `p+1`。
@@ -113,33 +111,9 @@
 - 每个版本必须写 MD 留档（方法、详细修改点、参数、命令、结果、结论、下一步）。
 - 推荐在新一轮开始前先读取上一版本留档，防止重复试验与口径漂移。
 
-15.1) **版本更新前 GitHub 快照（硬约束）**
 
-- 适用范围：任何准备发布新版本（`vxpx`）的代码或配置改动，在**进入实施**之前。
-- 开始实施前必须确保 `git status`（工作区状态）为 clean；若不 clean，先 `git add/commit`（提交本地改动形成可回退点）或 `git stash`（临时存放改动）处理到 clean。
-- 必须执行 `git push`（推送当前分支到远端 `origin`）并确认成功后，才允许开始改代码、改配置、创建新版本目录。
-- 推荐：同时打快照 tag（`git tag -a <version>-pre -m "pre-change snapshot"`）并 `git push --tags`（推送标签），便于一键回退。
-- 若 `git push` 或 `git push --tags` 失败：立即停止实施，先排查 SSH/权限/网络/远端分支保护等问题，确保远端有可回退快照。
 
-16) **版本归档标准（执行细则，硬约束）**
 
-- 适用范围：`v1` 起全部版本（含历史整理与后续新增）。
-- 目录结构必须是：`docs/versions/<version>/`；禁止仅保留单文件 `docs/versions/<version>.md` 作为正式留档。
-- 每个版本目录必须包含且仅少不了以下四件套：
-  - `README.md`：版本目标、方法摘要、关键命令、代表 run、结论、下一步。
-  - `CHANGES.md`：相对上一版的代码/配置改动明细（推荐 `old -> new` 口径）与受影响文件清单。
-  - `RESULTS.md`：`table2_kpis_mean_raw.csv` 来源路径、short/long 指标、基线对比、门槛检查、`failure_reason` 分布。
-  - `runs/README.md`：代表 run 的 `run_dir`/`run_json`/`kpi` 路径，以及该版本可追溯 run 列表。
-- 归档入口统一为仓库根目录 `README.md` 中“版本总索引（v1 -> ...）”；`docs/versions/README.md` 作为子目录镜像索引同步维护。
-- 指标与路径必须可追溯到真实文件；禁止编造历史结果。无法确认的数据必须写 `N/A` 并注明原因。
-- `docs/versions/README.md` 必须同步更新（版本号、目录路径、short/long 最佳 SR、baseline、状态）。
-- 历史版本整理时，允许保持算法不变，仅做文档结构与口径标准化；不得借机改写实验结论。
-- 归档语言要求：`docs/versions/**` 下版本留档四件套默认必须使用中文撰写（含 `README.md`、`CHANGES.md`、`RESULTS.md`、`runs/README.md`）。
-- 仅当你明确要求时，才允许对应版本留档使用英文或中英双语。
-- 为保证可执行与可复现，命令行、文件路径、参数名、代码标识符可保留英文原文，不要求翻译。
-- 每次运行完都要求归档：任何一次运行（含 `self-check`、`smoke`、`full`、训练命令、推理命令）结束后，必须在同一工作轮次内更新对应版本留档。
-- 最小归档内容：在对应 `docs/versions/<version>/` 四件套中至少记录本次运行命令、`run_dir`、`run_json`、`kpi` 路径、short/long 关键指标与 `failure_reason` 分布（若该次运行产出该字段）。
-- 运行失败也必须归档：若结果缺失，必须写 `N/A` 并注明失败原因（如报错中断、超时、人工终止）。
 
 17) **文件写入限制（Claude Code 客户端问题，硬约束）**
 

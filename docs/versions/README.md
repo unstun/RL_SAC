@@ -1,6 +1,6 @@
-# 版本留档索引（v1 → v8p4）
+# 版本留档索引（v1 → v9）
 
-- 归档入口：仓库根目录 `README.md` 的”版本总索引（v1 → v8p3）”。
+- 归档入口：仓库根目录 `README.md` 的”版本总索引（v1 → v9）”。
 - 本文件保留为 `docs/versions/` 内部快速导航，与根 README 保持同一口径。
 - 历史目录 `v3p1`~`v3p11` 保留原始记录，未纳入本轮重编号。
 - 早期误混入版本链已于 2026-02-09 清理，当前主线编号延续至 `v7p2p1`。
@@ -42,6 +42,16 @@
 | `v8p2` | `docs/versions/v8p2/` | `configs/v8p2.json` | `runs/v8p2-smoke1/train_20260221_224028` | `0.0` / `0.0` | `1.0` / `1.0` | CBF-Safe SAC，smoke SR=0%（150ep），best_return=477.5 |
 | `v8p3` | `docs/versions/v8p3/` | `configs/v8p3.json` | `runs/v8p3-smoke1/train_20260222_011340` | `0.0` / `0.0` | `1.0` / `1.0` | TECRL+ExpPotential+PLR，smoke SR=0%，alpha 崩塌到 0.003 |
 | `v8p4` | `docs/versions/v8p4/` | `configs/v8p4.json` | `runs/v8p4-smoke1/train_20260222_090846` | `0.0` / `0.0` | `1.0` / `1.0` | v8p3 bugfix（alpha_min=0.01, PBRS, budget=2.0），smoke SR=0%，alpha 稳定 0.010 |
+
+## 回归 DQN 版本（v9 →）
+
+SAC 迁移（v8→v8p4）全部 SR=0%，结论：离散动作空间下 SAC 结构性不匹配。V9 起回归 CNN-DDQN，聚焦路径质量优化。
+
+| 版本 | 目录 | 主 config | 关键 run | CNN-DDQN SR (short/long) | 基线 SR (short/long) | 状态 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `v9` | `docs/versions/v9/` | `configs/v9.json` | `runs/v9-smoke1/train_20260222_111340` | `0.667` / `0.667` | `1.0` / `1.0` | smoke SR=66.7%，曲率改善但惩罚过重 |
+| `v9p1` | `docs/versions/v9p1/` | `configs/v9p1.json` | `runs/v9p1-smoke1/` | `0.667` / `0.0` | `1.0` / `1.0` | A* corridor 惩罚，long SR=0% |
+| `v9p2` | `docs/versions/v9p2/` | — (CLI 覆盖 v7p1) | `runs/v9p2-full/20260222_154658` | `0.95` / `0.95` | `0.95` / `1.0` | **当前最佳**：short path 赢 baseline，long 仍有差距 |
 
 ## baseline-only 排除口径
 - 上表“关键 run”仅统计 RL 运行（`skip_rl=false`）。
