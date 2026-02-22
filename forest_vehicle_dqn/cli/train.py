@@ -2363,6 +2363,7 @@ def train_one_sac(
     cbf_safety_margin_m: float = 0.15,
     use_tecrl: bool = False,
     entropy_budget_ratio: float = 0.6,
+    alpha_min: float = 0.0,
     lr_entropy_critic: float = 3e-4,
     use_syllabus_plr: bool = False,
     plr_levels_str: str = "6,10,14,20,30,42",
@@ -2405,6 +2406,7 @@ def train_one_sac(
         use_tecrl=bool(use_tecrl or sac_cfg_dict.get("sac_use_tecrl", False)),
         lr_entropy_critic=float(sac_cfg_dict.get("sac_lr_entropy_critic", lr_entropy_critic)),
         entropy_budget_ratio=float(sac_cfg_dict.get("sac_entropy_budget_ratio", entropy_budget_ratio)),
+        alpha_min=float(sac_cfg_dict.get("sac_alpha_min", alpha_min)),
     )
     agent = SACAgent(sac_config, device=str(device), seed=seed)
     log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
@@ -3300,6 +3302,7 @@ def build_parser() -> argparse.ArgumentParser:
     # v8p3: TECRL + exponential potential + Syllabus PLR
     ap.add_argument("--sac-use-tecrl", action="store_true", default=False)
     ap.add_argument("--sac-entropy-budget-ratio", type=float, default=0.6)
+    ap.add_argument("--sac-alpha-min", type=float, default=0.0)
     ap.add_argument("--sac-lr-entropy-critic", type=float, default=3e-4)
     ap.add_argument("--reward-potential-base", type=float, default=0.0)
     ap.add_argument("--reward-potential-bias", type=float, default=0.0)
@@ -4003,6 +4006,8 @@ def main(argv: list[str] | None = None) -> int:
                                                sac_cfg_raw.get("sac_use_tecrl", False))),
                         entropy_budget_ratio=float(getattr(args, "sac_entropy_budget_ratio",
                                                            sac_cfg_raw.get("sac_entropy_budget_ratio", 0.6))),
+                        alpha_min=float(getattr(args, "sac_alpha_min",
+                                                sac_cfg_raw.get("sac_alpha_min", 0.0))),
                         lr_entropy_critic=float(getattr(args, "sac_lr_entropy_critic",
                                                         sac_cfg_raw.get("sac_lr_entropy_critic", 3e-4))),
                         use_syllabus_plr=bool(getattr(args, "use_syllabus_plr",
