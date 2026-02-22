@@ -1359,7 +1359,7 @@ class AMRBicycleEnv(gym.Env):
                 phi_now = math.exp(base * prog_now)
                 phi_prev = math.exp(base * prog_prev)
                 reward += self.reward_c_prog * (
-                    (phi_now + bias) - self._gamma * (phi_prev + bias))
+                    self._gamma * (phi_now + bias) - (phi_prev + bias))
             else:
                 # Linear potential-based shaping (v8p2)
                 if math.isfinite(dist_before) and math.isfinite(dist_after):
