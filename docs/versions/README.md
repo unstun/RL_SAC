@@ -1,4 +1,4 @@
-# 版本留档索引（v1 → v8p3）
+# 版本留档索引（v1 → v8p4）
 
 - 归档入口：仓库根目录 `README.md` 的”版本总索引（v1 → v8p3）”。
 - 本文件保留为 `docs/versions/` 内部快速导航，与根 README 保持同一口径。
@@ -41,6 +41,7 @@
 | `v8p1` | `docs/versions/v8p1/` | `configs/v8.json` | `runs/v8-fix1/train_20260221_212443` | `0.0` / `0.0` | `1.0` / `1.0` | 稳定性修复成功，smoke SR=0%（150ep 不足） |
 | `v8p2` | `docs/versions/v8p2/` | `configs/v8p2.json` | `runs/v8p2-smoke1/train_20260221_224028` | `0.0` / `0.0` | `1.0` / `1.0` | CBF-Safe SAC，smoke SR=0%（150ep），best_return=477.5 |
 | `v8p3` | `docs/versions/v8p3/` | `configs/v8p3.json` | `runs/v8p3-smoke1/train_20260222_011340` | `0.0` / `0.0` | `1.0` / `1.0` | TECRL+ExpPotential+PLR，smoke SR=0%，alpha 崩塌到 0.003 |
+| `v8p4` | `docs/versions/v8p4/` | `configs/v8p4.json` | `runs/v8p4-smoke1/train_20260222_090846` | `0.0` / `0.0` | `1.0` / `1.0` | v8p3 bugfix（alpha_min=0.01, PBRS, budget=2.0），smoke SR=0%，alpha 稳定 0.010 |
 
 ## baseline-only 排除口径
 - 上表“关键 run”仅统计 RL 运行（`skip_rl=false`）。
