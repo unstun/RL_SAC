@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
@@ -42,6 +43,7 @@ class SACConfig:
     use_tecrl: bool = False
     lr_entropy_critic: float = 3e-4
     entropy_budget_ratio: float = 0.6  # ρ: trajectory entropy budget
+    alpha_min: float = 0.0  # minimum alpha (0 = no floor)
 
 
 class SACReplayBuffer:
@@ -228,6 +230,9 @@ class SACAgent:
         torch.nn.utils.clip_grad_norm_(
             [self.log_alpha], self.cfg.grad_clip_norm)
         self.alpha_opt.step()
+        if self.cfg.alpha_min > 0:
+            with torch.no_grad():
+                self.log_alpha.data.clamp_(min=math.log(self.cfg.alpha_min))
 
         # --- Soft target update ---
         with torch.no_grad():
@@ -331,6 +336,9 @@ class SACAgent:
         torch.nn.utils.clip_grad_norm_(
             [self.log_alpha], self.cfg.grad_clip_norm)
         self.alpha_opt.step()
+        if self.cfg.alpha_min > 0:
+            with torch.no_grad():
+                self.log_alpha.data.clamp_(min=math.log(self.cfg.alpha_min))
 
         # --- 5. Soft target update (both critics) ---
         with torch.no_grad():
