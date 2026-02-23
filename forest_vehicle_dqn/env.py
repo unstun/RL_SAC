@@ -573,46 +573,6 @@ def euclidean_goal_dist_m(
     return dist.astype(np.float32, copy=False)
 
 
-def dijkstra_goal_dist_m(
-    shape_hw: tuple[int, int],
-    *,
-    goal_xy: tuple[int, int],
-    obstacle_grid: np.ndarray,
-    cell_size_m: float,
-) -> np.ndarray:
-    """Shortest-path distance field through free space (Dijkstra).
-
-    Returns a (H, W) float32 array. Obstacle/unreachable cells get a large
-    finite fallback (diagonal + cell_size) so bilinear interpolation stays safe.
-    """
-    import heapq
-    h, w = int(shape_hw[0]), int(shape_hw[1])
-    cell = float(cell_size_m)
-    gx, gy = int(goal_xy[0]), int(goal_xy[1])
-    INF = float(math.hypot(h, w) * cell + cell)
-    dist = np.full((h, w), INF, dtype=np.float64)
-    if obstacle_grid[gy, gx]:
-        # Goal on obstacle — fall back to Euclidean
-        return euclidean_goal_dist_m(shape_hw, goal_xy=goal_xy,
-                                     cell_size_m=cell_size_m)
-    dist[gy, gx] = 0.0
-    pq: list[tuple[float, int, int]] = [(0.0, gx, gy)]
-    DIAG = cell * math.sqrt(2.0)
-    while pq:
-        d, cx, cy = heapq.heappop(pq)
-        if d > dist[cy, cx]:
-            continue
-        for dx, dy in ((-1,0),(1,0),(0,-1),(0,1),
-                       (-1,-1),(-1,1),(1,-1),(1,1)):
-            nx, ny = cx + dx, cy + dy
-            if 0 <= nx < w and 0 <= ny < h and not obstacle_grid[ny, nx]:
-                nd = d + (DIAG if (dx and dy) else cell)
-                if nd < dist[ny, nx]:
-                    dist[ny, nx] = nd
-                    heapq.heappush(pq, (nd, nx, ny))
-    return dist.astype(np.float32, copy=False)
-
-
 class AMRBicycleEnv(gym.Env):
     """Ackermann/bicycle dynamics on a grid occupancy map using EDT for collision + clearance (OD)."""
 
@@ -682,12 +642,6 @@ class AMRBicycleEnv(gym.Env):
         # Exponential potential-based shaping (v8p3)
         reward_potential_base: float = 0.0,
         reward_potential_bias: float = 0.0,
-        # A*-guided reward shaping (v9p1)
-        reward_k_astar_dev: float = 0.0,
-        reward_astar_corridor_m: float = 1.5,
-        reward_astar_progress: bool = False,
-        # Dijkstra obstacle-aware progress (v9p2)
-        reward_dijkstra_progress: bool = False,
     ) -> None:
         super().__init__()
 
@@ -780,8 +734,6 @@ class AMRBicycleEnv(gym.Env):
         self._rand_free_xy = np.stack([free_x, free_y], axis=1).astype(np.int32, copy=False)
 
         # Goal-dependent fields (distance field + curriculum candidates).
-        # Must set dijkstra flag before _set_goal_xy uses it.
-        self.reward_dijkstra_progress = bool(reward_dijkstra_progress)
         self._set_goal_xy(self.goal_xy)
         # Start-dependent normalization.
         self._update_start_dependent_fields(start_xy=self.start_xy)
@@ -835,11 +787,6 @@ class AMRBicycleEnv(gym.Env):
         self._gamma = float(gamma)
         self.reward_potential_base = float(reward_potential_base)
         self.reward_potential_bias = float(reward_potential_bias)
-        # A*-guided reward shaping (v9p1)
-        self.reward_k_astar_dev = float(reward_k_astar_dev)
-        self.reward_astar_corridor_m = float(reward_astar_corridor_m)
-        self.reward_astar_progress = bool(reward_astar_progress)
-        self.reward_dijkstra_progress = bool(reward_dijkstra_progress)
         self._initial_dist = None  # set in reset()
         self._cbf_collision_thr = float(self.footprint.radius_m) + float(self._eps_cell_m)
         self.terminate_on_stuck = bool(terminate_on_stuck)
@@ -930,10 +877,6 @@ class AMRBicycleEnv(gym.Env):
         self._ha_start_xy: tuple[int, int] = self.start_xy
         self._astar_progress_idx: int = 0
         self._astar_start_xy: tuple[int, int] = self.start_xy
-        # A*-guided shaping runtime state (v9p1)
-        self._astar_ref_xy: np.ndarray | None = None  # (N, 2) continuous coords in meters
-        self._astar_ref_cumlen: np.ndarray | None = None  # (N,) cumulative path length
-        self._astar_ref_total_len: float = 0.0
 
     def _goal_pose_reached(self, *, d_goal_m: float, alpha_rad: float) -> bool:
         return (float(d_goal_m) <= float(self.goal_tolerance_m)) and (
@@ -977,19 +920,11 @@ class AMRBicycleEnv(gym.Env):
 
         self.goal_xy = (int(gx), int(gy))
 
-        if self.reward_dijkstra_progress:
-            self._goal_dist_m = dijkstra_goal_dist_m(
-                (int(self._height), int(self._width)),
-                goal_xy=self.goal_xy,
-                obstacle_grid=self._grid,
-                cell_size_m=self.cell_size_m,
-            )
-        else:
-            self._goal_dist_m = euclidean_goal_dist_m(
-                (int(self._height), int(self._width)),
-                goal_xy=self.goal_xy,
-                cell_size_m=self.cell_size_m,
-            )
+        self._goal_dist_m = euclidean_goal_dist_m(
+            (int(self._height), int(self._width)),
+            goal_xy=self.goal_xy,
+            cell_size_m=self.cell_size_m,
+        )
         self._goal_dist_fill_m = float(self._diag_m) + float(self.cell_size_m)
 
         # Curriculum: candidate start cells (reachable under clearance + minimum goal distance).
@@ -1321,13 +1256,6 @@ class AMRBicycleEnv(gym.Env):
         # Record initial distance for exponential potential shaping (v8p3)
         self._initial_dist = self._distance_to_goal_m()
 
-        # A*-guided shaping: compute reference path once per episode (v9p1)
-        self._astar_ref_xy = None
-        self._astar_ref_cumlen = None
-        self._astar_ref_total_len = 0.0
-        if self.reward_k_astar_dev > 0.0 or self.reward_astar_progress:
-            self._compute_astar_ref_path()
-
         obs = self._observe()
         info = {"agent_xy": self._agent_xy_for_plot(), "pose_m": (self._x_m, self._y_m, self._psi_rad)}
         return obs, info
@@ -1439,17 +1367,8 @@ class AMRBicycleEnv(gym.Env):
                 else:
                     reward += self.reward_c_prog * (float(d_goal_before) - self._gamma * float(d_goal_after))
         else:
-            # Legacy k_p progress reward — optionally A*-guided (v9p1)
-            if self.reward_astar_progress and self._astar_ref_xy is not None:
-                _, rem_before = self._astar_ref_query(x_before, y_before)
-                _, rem_after = self._astar_ref_query(float(self._x_m), float(self._y_m))
-                if math.isfinite(rem_before) and math.isfinite(rem_after):
-                    reward += self.reward_k_p * float(rem_before - rem_after)
-                elif math.isfinite(dist_before) and math.isfinite(dist_after):
-                    reward += self.reward_k_p * float(dist_before - dist_after)
-                else:
-                    reward += self.reward_k_p * float(d_goal_before - d_goal_after)
-            elif math.isfinite(dist_before) and math.isfinite(dist_after):
+            # Legacy k_p progress reward
+            if math.isfinite(dist_before) and math.isfinite(dist_after):
                 reward += self.reward_k_p * float(dist_before - dist_after)
             else:
                 reward += self.reward_k_p * float(d_goal_before - d_goal_after)
@@ -1473,11 +1392,6 @@ class AMRBicycleEnv(gym.Env):
                 float(self._x_m) - float(x_before),
                 float(self._y_m) - float(y_before)))
             reward -= self.reward_k_len * step_dist
-        # A* corridor deviation penalty (v9p1)
-        if self.reward_k_astar_dev > 0.0 and self._astar_ref_xy is not None:
-            d_astar, _ = self._astar_ref_query(float(self._x_m), float(self._y_m))
-            excess = max(0.0, d_astar - self.reward_astar_corridor_m)
-            reward -= self.reward_k_astar_dev * excess
         # Clearance-based safety shaping. Skip when already in collision to avoid compounding huge penalties.
         if not collision:
             od_pos = max(0.0, float(od_m))
@@ -2036,51 +1950,6 @@ class AMRBicycleEnv(gym.Env):
         self._ha_path_cache[key] = path
         return path
 
-    # ------------------------------------------------------------------
-    # A*-guided reward shaping helpers (v9p1)
-    # ------------------------------------------------------------------
-
-    def _compute_astar_ref_path(self) -> None:
-        """Compute Grid A* reference path and store as continuous coords."""
-        grid_map = grid_map_from_obstacles(
-            grid_y0_bottom=self._grid, cell_size_m=float(self.cell_size_m))
-        try:
-            res = plan_grid_astar(
-                grid_map=grid_map,
-                start_xy=(int(self.start_xy[0]), int(self.start_xy[1])),
-                goal_xy=(int(self.goal_xy[0]), int(self.goal_xy[1])),
-                timeout_s=2.0,
-                max_expanded=500_000,
-            )
-        except Exception:
-            return
-        if not bool(res.success) or len(res.path_xy_cells) < 2:
-            return
-        cs = float(self.cell_size_m)
-        pts = np.array([(float(x) * cs, float(y) * cs)
-                        for x, y in res.path_xy_cells], dtype=np.float64)
-        diffs = np.diff(pts, axis=0)
-        seg_lens = np.sqrt((diffs ** 2).sum(axis=1))
-        cumlen = np.zeros(len(pts), dtype=np.float64)
-        cumlen[1:] = np.cumsum(seg_lens)
-        self._astar_ref_xy = pts
-        self._astar_ref_cumlen = cumlen
-        self._astar_ref_total_len = float(cumlen[-1])
-
-    def _astar_ref_query(self, x_m: float, y_m: float) -> tuple[float, float]:
-        """Return (dist_to_path, remaining_path_len) for position (x_m, y_m).
-
-        If no A* ref path is available, returns (0.0, nan).
-        """
-        if self._astar_ref_xy is None:
-            return 0.0, float('nan')
-        pt = np.array([float(x_m), float(y_m)], dtype=np.float64)
-        dists_sq = ((self._astar_ref_xy - pt) ** 2).sum(axis=1)
-        nearest_idx = int(np.argmin(dists_sq))
-        dist_to_path = float(math.sqrt(float(dists_sq[nearest_idx])))
-        remaining = self._astar_ref_total_len - float(
-            self._astar_ref_cumlen[nearest_idx])
-        return dist_to_path, float(remaining)
 
     def _astar_path_with_curve_opt(
         self,

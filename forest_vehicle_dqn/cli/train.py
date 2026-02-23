@@ -3268,16 +3268,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--forest-reward-k-p", type=float, default=12.0)
     ap.add_argument("--forest-reward-k-kappa", type=float, default=0.2)
     ap.add_argument("--forest-reward-k-len", type=float, default=0.0)
-    ap.add_argument("--forest-reward-k-astar-dev", type=float, default=0.0,
-                    help="A* corridor deviation penalty coefficient (v9p1)")
-    ap.add_argument("--forest-reward-astar-corridor-m", type=float, default=1.5,
-                    help="A* corridor tolerance in meters (v9p1)")
-    ap.add_argument("--forest-reward-astar-progress", "--no-forest-reward-astar-progress",
-                    action=argparse.BooleanOptionalAction, default=False,
-                    help="Use A* remaining distance for progress reward (v9p1)")
-    ap.add_argument("--forest-reward-dijkstra-progress", "--no-forest-reward-dijkstra-progress",
-                    action=argparse.BooleanOptionalAction, default=False,
-                    help="Use Dijkstra obstacle-aware distance for progress reward (v9p2)")
     ap.add_argument("--forest-action-mode", type=str, default="discrete")
     ap.add_argument("--sac-lr-actor", type=float, default=3e-4)
     ap.add_argument("--sac-lr-critic", type=float, default=3e-4)
@@ -3899,10 +3889,6 @@ def main(argv: list[str] | None = None) -> int:
                 reward_k_o=float(getattr(args, "forest_reward_k_o", 1.5)),
                 reward_potential_base=float(getattr(args, "reward_potential_base", 0.0)),
                 reward_potential_bias=float(getattr(args, "reward_potential_bias", 0.0)),
-                reward_k_astar_dev=float(getattr(args, "forest_reward_k_astar_dev", 0.0)),
-                reward_astar_corridor_m=float(getattr(args, "forest_reward_astar_corridor_m", 1.5)),
-                reward_astar_progress=bool(getattr(args, "forest_reward_astar_progress", False)),
-                reward_dijkstra_progress=bool(getattr(args, "forest_reward_dijkstra_progress", False)),
             )
             forest_demo_data = None
             has_dqn_algos = any(str(a) != "cnn-sac" for a in args.rl_algos)
