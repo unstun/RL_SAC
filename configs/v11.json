@@ -1,0 +1,43 @@
+{
+  "_meta": {
+    "title": "v11: plug-and-play CNN-DDQN modules (Dueling + CBAM + NoisyNet + MHA + QR-DQN)",
+    "date": "2026-02-24",
+    "base": "v9p2",
+    "summary": "Add 5 plug-and-play modules on top of v9p2. Each independently toggled via CLI flags.",
+    "new_flags": {
+      "--dueling": "Dueling DQN (Wang et al., 2016): split Q into V(s) + A(s,a)",
+      "--cbam": "CBAM attention on CNN feature maps (Woo et al., ECCV 2018)",
+      "--noisy-net": "NoisyNet exploration via parameter noise (Fortunato et al., ICLR 2018)",
+      "--mha": "Spatial multi-head self-attention on CNN feature maps",
+      "--mha-heads N": "Number of attention heads (default 4)",
+      "--n-quantiles N": "QR-DQN quantile regression (Dabney et al., AAAI 2018; 1=standard DQN)"
+    },
+    "commands": {
+      "smoke_dueling": "conda run -n ros2py310 python -m forest_vehicle_dqn.cli.train --profile v9p2 --episodes 150 --dueling --out v11-dueling",
+      "smoke_cbam": "conda run -n ros2py310 python -m forest_vehicle_dqn.cli.train --profile v9p2 --episodes 150 --cbam --out v11-cbam",
+      "smoke_noisy": "conda run -n ros2py310 python -m forest_vehicle_dqn.cli.train --profile v9p2 --episodes 150 --noisy-net --out v11-noisy",
+      "smoke_mha": "conda run -n ros2py310 python -m forest_vehicle_dqn.cli.train --profile v9p2 --episodes 150 --mha --out v11-mha",
+      "smoke_qr32": "conda run -n ros2py310 python -m forest_vehicle_dqn.cli.train --profile v9p2 --episodes 150 --n-quantiles 32 --out v11-qr32",
+      "smoke_all": "conda run -n ros2py310 python -m forest_vehicle_dqn.cli.train --profile v9p2 --episodes 150 --dueling --cbam --noisy-net --mha --n-quantiles 32 --out v11-all"
+    }
+  },
+  "train": {
+    "envs": ["forest_a"],
+    "out": "v11",
+    "rl_algos": ["cnn-ddqn"],
+    "demo_mode": "dqfd",
+    "episodes": 150,
+    "seed": 21,
+    "device": "cuda",
+    "progress": true
+  },
+  "infer": {
+    "envs": ["forest_a::short", "forest_a::mid", "forest_a::long"],
+    "models": "v11",
+    "out": "v11",
+    "rl_algos": ["cnn-ddqn"],
+    "baselines": ["hybrid_astar_mpc"],
+    "runs": 5,
+    "progress": true
+  }
+}

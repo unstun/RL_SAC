@@ -255,7 +255,7 @@ def rollout_agent(
                 # - strict_no_fallback=False: keep admissibility-gated replacement logic.
                 with torch.no_grad():
                     x = torch.from_numpy(obs.astype(np.float32, copy=False)).to(agent.device)
-                    q = agent.q(x.unsqueeze(0)).squeeze(0)
+                    q = agent._q_values(agent.q(x.unsqueeze(0))).squeeze(0)
 
                 a0 = int(torch.argmax(q).item())
                 a = int(a0)

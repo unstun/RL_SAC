@@ -550,7 +550,7 @@ def _eval_train_progress_suites(
             steps_eval += 1
             with torch.no_grad():
                 x = torch.from_numpy(obs_eval.astype(np.float32, copy=False)).to(agent.device)
-                q = agent.q(x.unsqueeze(0)).squeeze(0)
+                q = agent._q_values(agent.q(x.unsqueeze(0))).squeeze(0)
                 a, argmax_inadmissible = _forest_policy_action_from_q(
                     env,
                     q,
@@ -986,7 +986,9 @@ def train_one(
     save_ckpt_long_min_dist_m: float,
     save_ckpt_long_max_dist_m: float | None,
     save_ckpt_long_sr_floor: float,
-    progress: bool,
+    periodic_ckpt_every: int = 0,
+    periodic_ckpt_keep: int = 0,
+    progress: bool = False,
     device: torch.device,
     live_viewer: TrainLiveViewer | None = None,
     progress_write: Callable[[str], None] | None = None,
@@ -1226,7 +1228,7 @@ def train_one(
     def _forest_q_values(obs_arr: np.ndarray) -> torch.Tensor:
         with torch.no_grad():
             x = torch.from_numpy(obs_arr.astype(np.float32, copy=False)).to(agent.device)
-            return agent.q(x.unsqueeze(0)).squeeze(0)
+            return agent._q_values(agent.q(x.unsqueeze(0))).squeeze(0)
 
     def _forest_greedy_action(obs_eval: np.ndarray) -> tuple[int, bool]:
         if isinstance(env, AMRBicycleEnv):
@@ -1980,6 +1982,17 @@ def train_one(
             best_q = clone_state_dict(agent.q.state_dict())
             best_q_target = clone_state_dict(agent.q_target.state_dict())
             best_train_steps = int(agent._train_steps)
+
+        if int(periodic_ckpt_every) > 0 and (ep + 1) % int(periodic_ckpt_every) == 0:
+            _pdir = out_dir / "models" / env.map_spec.name / "periodic"
+            _pdir.mkdir(parents=True, exist_ok=True)
+            _ppath = _pdir / f"ep{ep + 1:05d}.pt"
+            agent.save(_ppath)
+            log(f"[train] [{run_label}] periodic ckpt: ep={ep + 1} -> {_ppath}")
+            if int(periodic_ckpt_keep) > 0:
+                _existing = sorted(_pdir.glob("ep*.pt"))
+                for _old in _existing[: -int(periodic_ckpt_keep)]:
+                    _old.unlink(missing_ok=True)
 
         if maybe_abort_on_throughput(ep):
             break
@@ -2751,6 +2764,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--eps-decay", type=int, default=2000, help="Epsilon linear decay episodes.")
     ap.add_argument("--hidden-layers", type=int, default=3, help="Q-network hidden layer count.")
     ap.add_argument("--hidden-dim", type=int, default=256, help="Q-network hidden width.")
+    ap.add_argument("--dueling", action="store_true", default=False, help="Use Dueling DQN architecture (V + A streams).")
+    ap.add_argument("--cbam", action="store_true", default=False, help="CBAM attention on CNN feature maps (Woo et al., ECCV 2018).")
+    ap.add_argument("--noisy-net", action="store_true", default=False, help="NoisyNet exploration (Fortunato et al., ICLR 2018); disables epsilon-greedy.")
+    ap.add_argument("--mha", action="store_true", default=False, help="Spatial multi-head self-attention on CNN feature maps.")
+    ap.add_argument("--mha-heads", type=int, default=4, help="Number of attention heads for --mha.")
+    ap.add_argument("--n-quantiles", type=int, default=1, help="QR-DQN quantiles (1=standard, >1=quantile regression).")
     ap.add_argument(
         "--demo-mode",
         type=str,
@@ -2904,6 +2923,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Joint checkpoint selection: require long success_rate >= this floor before comparing costs.",
+    )
+    ap.add_argument(
+        "--periodic-ckpt-every",
+        type=int,
+        default=10,
+        help="Save a periodic checkpoint every N episodes to models/<env>/periodic/ep{N:05d}.pt. 0 disables.",
+    )
+    ap.add_argument(
+        "--periodic-ckpt-keep",
+        type=int,
+        default=0,
+        help="Keep only the latest N periodic checkpoints (0 = keep all).",
     )
     ap.add_argument(
         "--eval-every",
@@ -3771,6 +3802,12 @@ def main(argv: list[str] | None = None) -> int:
         eps_decay=int(getattr(args, "eps_decay", agent_cfg.eps_decay)),
         hidden_layers=int(getattr(args, "hidden_layers", agent_cfg.hidden_layers)),
         hidden_dim=int(getattr(args, "hidden_dim", agent_cfg.hidden_dim)),
+        dueling=bool(getattr(args, "dueling", False)),
+        cbam=bool(getattr(args, "cbam", False)),
+        noisy_net=bool(getattr(args, "noisy_net", False)),
+        mha=bool(getattr(args, "mha", False)),
+        mha_heads=int(getattr(args, "mha_heads", 4)),
+        n_quantiles=int(getattr(args, "n_quantiles", 1)),
         demo_mode=str(demo_mode),
         dqfd_lambda_n=float(getattr(args, "dqfd_lambda_n", 1.0)),
         l2_reg=float(getattr(args, "dqfd_l2", 0.0)),
@@ -4164,6 +4201,8 @@ def main(argv: list[str] | None = None) -> int:
                         else float(getattr(args, "save_ckpt_long_max_dist_m", 0.0))
                     ),
                     save_ckpt_long_sr_floor=float(getattr(args, "save_ckpt_long_sr_floor", 0.0)),
+                    periodic_ckpt_every=int(getattr(args, "periodic_ckpt_every", 0)),
+                    periodic_ckpt_keep=int(getattr(args, "periodic_ckpt_keep", 0)),
                     progress=progress,
                     device=device,
                     live_viewer=live_viewer,

@@ -38,6 +38,18 @@ class AgentConfig:
     hidden_layers: int = 3
     hidden_dim: int = 256
 
+    # Dueling DQN (Wang et al., 2016): split Q into V(s) + A(s,a) - mean(A).
+    dueling: bool = False
+    # CBAM attention on CNN feature maps (Woo et al., ECCV 2018).
+    cbam: bool = False
+    # NoisyNet (Fortunato et al., ICLR 2018): replace Linear with NoisyLinear.
+    noisy_net: bool = False
+    # Spatial multi-head self-attention on CNN feature maps (Vaswani et al., 2017).
+    mha: bool = False
+    mha_heads: int = 4
+    # QR-DQN (Dabney et al., AAAI 2018): 1 = standard DQN, >1 = quantile regression.
+    n_quantiles: int = 1
+
     # Expert margin loss (DQfD-style) for forest stabilization.
     demo_margin: float = 0.8
     demo_lambda: float = 1.0
@@ -136,6 +148,12 @@ class DQNFamilyAgent:
                 "scalar_dim": int(layout.scalar_dim),
                 "map_channels": int(layout.map_channels),
                 "map_size": int(layout.map_size),
+                "dueling": bool(getattr(config, "dueling", False)),
+                "cbam": bool(getattr(config, "cbam", False)),
+                "noisy_net": bool(getattr(config, "noisy_net", False)),
+                "mha": bool(getattr(config, "mha", False)),
+                "mha_heads": int(getattr(config, "mha_heads", 4)),
+                "n_quantiles": int(getattr(config, "n_quantiles", 1)),
             }
         else:
             self._net_cls = MLPQNetwork
@@ -201,6 +219,62 @@ class DQNFamilyAgent:
         t = float(np.clip(float(self._train_steps) / float(max(1, int(beta_steps))), 0.0, 1.0))
         return float(beta0 + (1.0 - beta0) * t)
 
+    def _quantile_td_loss(
+        self,
+        q_quantiles: torch.Tensor,
+        target_quantiles: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Quantile Huber loss for QR-DQN (Dabney et al., AAAI 2018).
+
+        Args:
+            q_quantiles: (B, N) predicted quantiles for chosen action.
+            target_quantiles: (B, N) target quantiles.
+            weights: (B,) optional importance-sampling weights.
+        Returns:
+            Scalar loss.
+        """
+        nq = q_quantiles.shape[1]
+        tau = (torch.arange(nq, device=q_quantiles.device, dtype=torch.float32) + 0.5) / float(nq)
+        # (B, N_pred, N_target)
+        diff = target_quantiles.unsqueeze(1) - q_quantiles.unsqueeze(2)
+        huber = F.smooth_l1_loss(
+            q_quantiles.unsqueeze(2).expand_as(diff),
+            target_quantiles.unsqueeze(1).expand_as(diff),
+            reduction="none",
+        )
+        qw = (tau.view(1, -1, 1) - (diff < 0).float()).abs()
+        loss_per_sample = (qw * huber).sum(dim=2).mean(dim=1)  # (B,)
+        if weights is not None:
+            loss_per_sample = loss_per_sample * weights
+        return loss_per_sample.mean()
+
+    def _next_q_quantiles(
+        self,
+        next_obs: torch.Tensor,
+        mask: torch.Tensor,
+        nq: int,
+    ) -> torch.Tensor:
+        """Compute target quantiles for next state (QR-DQN helper).
+
+        Returns: (B, nq) quantiles for greedy/DDQN next action.
+        """
+        B = int(next_obs.shape[0])
+        raw_target = self.q_target(next_obs).reshape(B, self._n_actions, nq)
+        q_mean_target = raw_target.mean(dim=2)
+        q_mean_target = q_mean_target.masked_fill(~mask, torch.finfo(q_mean_target.dtype).min)
+
+        if self.base_algo == "ddqn":
+            raw_online = self.q(next_obs).reshape(B, self._n_actions, nq)
+            q_mean_online = raw_online.mean(dim=2)
+            q_mean_online = q_mean_online.masked_fill(~mask, torch.finfo(q_mean_online.dtype).min)
+            next_action = q_mean_online.argmax(dim=1)
+        else:
+            next_action = q_mean_target.argmax(dim=1)
+
+        tgt = raw_target.gather(1, next_action.view(-1, 1, 1).expand(-1, -1, nq)).squeeze(1)
+        return torch.where(torch.isfinite(tgt), tgt, torch.zeros_like(tgt))
+
     def _rebuild_networks(
         self,
         net_cls: type[nn.Module],
@@ -229,13 +303,24 @@ class DQNFamilyAgent:
             decay_episodes=self.config.eps_decay,
         )
 
+    def _q_values(self, raw: torch.Tensor) -> torch.Tensor:
+        """Convert raw network output to Q-values, handling QR-DQN quantiles."""
+        nq = int(getattr(self.config, "n_quantiles", 1))
+        if nq > 1:
+            # raw: (..., n_actions * n_quantiles) -> mean over quantiles
+            shape = raw.shape[:-1] + (self._n_actions, nq)
+            return raw.reshape(shape).mean(dim=-1)
+        return raw
+
     def act(self, obs: np.ndarray, *, episode: int, explore: bool = True) -> int:
-        if explore and (self._rng.random() < self.epsilon(episode)):
+        # NoisyNet provides exploration via parameter noise; skip ε-greedy.
+        use_noisy = bool(getattr(self.config, "noisy_net", False))
+        if explore and not use_noisy and (self._rng.random() < self.epsilon(episode)):
             return int(self._rng.integers(0, self._n_actions))
 
         with torch.no_grad():
             x = torch.from_numpy(obs.astype(np.float32, copy=False)).to(self.device)
-            q = self.q(x.unsqueeze(0)).squeeze(0)
+            q = self._q_values(self.q(x.unsqueeze(0))).squeeze(0)
             return int(torch.argmax(q).item())
 
     def act_masked(
@@ -254,7 +339,8 @@ class DQNFamilyAgent:
             if mask.size != self._n_actions:
                 raise ValueError("action_mask must have shape (n_actions,)")
 
-        if explore and (self._rng.random() < self.epsilon(episode)):
+        use_noisy = bool(getattr(self.config, "noisy_net", False))
+        if explore and not use_noisy and (self._rng.random() < self.epsilon(episode)):
             if mask is None:
                 return int(self._rng.integers(0, self._n_actions))
             idxs = np.nonzero(mask)[0]
@@ -264,7 +350,7 @@ class DQNFamilyAgent:
 
         with torch.no_grad():
             x = torch.from_numpy(obs.astype(np.float32, copy=False)).to(self.device)
-            q = self.q(x.unsqueeze(0)).squeeze(0)
+            q = self._q_values(self.q(x.unsqueeze(0))).squeeze(0)
             if mask is not None:
                 q = q.clone()
                 q[torch.from_numpy(~mask).to(self.device)] = torch.finfo(q.dtype).min
@@ -275,7 +361,7 @@ class DQNFamilyAgent:
         kk = int(max(1, int(k)))
         with torch.no_grad():
             x = torch.from_numpy(obs.astype(np.float32, copy=False)).to(self.device)
-            q = self.q(x.unsqueeze(0)).squeeze(0)
+            q = self._q_values(self.q(x.unsqueeze(0))).squeeze(0)
             kk = int(min(int(kk), int(q.numel())))
             return torch.topk(q, k=kk, dim=0).indices.detach().cpu().numpy()
 
@@ -489,6 +575,11 @@ class DQNFamilyAgent:
         if len(self.replay) < self.config.batch_size:
             return {}
 
+        # NoisyNet: refresh noise before each update.
+        if bool(getattr(self.config, "noisy_net", False)) and hasattr(self.q, "reset_noise"):
+            self.q.reset_noise()
+            self.q_target.reset_noise()
+
         mode = self._demo_mode()
         if mode == "dqfd":
             batch = self.replay.sample(self.config.batch_size, beta=float(self._per_beta()))
@@ -509,35 +600,52 @@ class DQNFamilyAgent:
         demos = torch.from_numpy(batch.demos).to(self.device)
         weights = torch.from_numpy(batch.weights).to(self.device)
 
-        q_all = self.q(obs)
-        q_values = q_all.gather(1, actions.view(-1, 1)).squeeze(1)
+        q_all_raw = self.q(obs)
+        nq = max(1, int(getattr(self.config, "n_quantiles", 1)))
+        if nq > 1:
+            B = int(obs.shape[0])
+            q_all_q = q_all_raw.reshape(B, self._n_actions, nq)
+            q_all = q_all_q.mean(dim=2)          # (B, n_actions) for margin loss
+            q_quantiles = q_all_q.gather(1, actions.view(-1, 1, 1).expand(-1, -1, nq)).squeeze(1)  # (B, nq)
+            q_values = q_quantiles.mean(dim=1)   # (B,) scalar for PER
+        else:
+            q_all = q_all_raw                    # (B, n_actions)
+            q_quantiles = None
+            q_values = q_all.gather(1, actions.view(-1, 1)).squeeze(1)
 
         if mode == "legacy":
             # Legacy implementation: n-step TD target only (+ optional demo losses).
             with torch.no_grad():
                 mask = next_action_masks_n.to(torch.bool)
-                if self.base_algo == "ddqn":
-                    q_next_online = self.q(next_obs_n)
-                    q_next_online = q_next_online.masked_fill(~mask, torch.finfo(q_next_online.dtype).min)
-                    next_actions = torch.argmax(q_next_online, dim=1, keepdim=True)
-
-                    q_next_target = self.q_target(next_obs_n)
-                    q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
-                    next_q = q_next_target.gather(1, next_actions).squeeze(1)
-                else:
-                    q_next_target = self.q_target(next_obs_n)
-                    q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
-                    next_q = q_next_target.max(dim=1).values
-
-                next_q = torch.where(torch.isfinite(next_q), next_q, torch.zeros_like(next_q))
                 gamma = float(self.config.gamma)
                 gamma_n = torch.pow(
                     torch.tensor(gamma, device=self.device, dtype=torch.float32), n_steps_n.to(torch.float32)
                 )
-                target = rewards_n + (1.0 - dones_n) * (gamma_n * next_q)
 
-            losses = self.loss_fn(q_values, target)
-            td_loss = losses.mean()
+                if nq > 1:
+                    # QR-DQN: compute per-quantile targets.
+                    next_tgt_q = self._next_q_quantiles(next_obs_n, mask, nq)
+                    target_q = rewards_n.unsqueeze(1) + (1.0 - dones_n.unsqueeze(1)) * (gamma_n.unsqueeze(1) * next_tgt_q)
+                else:
+                    if self.base_algo == "ddqn":
+                        q_next_online = self._q_values(self.q(next_obs_n))
+                        q_next_online = q_next_online.masked_fill(~mask, torch.finfo(q_next_online.dtype).min)
+                        next_actions = torch.argmax(q_next_online, dim=1, keepdim=True)
+                        q_next_target = self._q_values(self.q_target(next_obs_n))
+                        q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
+                        next_q = q_next_target.gather(1, next_actions).squeeze(1)
+                    else:
+                        q_next_target = self._q_values(self.q_target(next_obs_n))
+                        q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
+                        next_q = q_next_target.max(dim=1).values
+                    next_q = torch.where(torch.isfinite(next_q), next_q, torch.zeros_like(next_q))
+                    target = rewards_n + (1.0 - dones_n) * (gamma_n * next_q)
+
+            if nq > 1:
+                td_loss = self._quantile_td_loss(q_quantiles, target_q)
+            else:
+                losses = self.loss_fn(q_values, target)
+                td_loss = losses.mean()
 
             demo_lambda = float(getattr(self.config, "demo_lambda", 0.0))
             demo_margin = float(getattr(self.config, "demo_margin", 0.0))
@@ -601,37 +709,45 @@ class DQNFamilyAgent:
             mask1 = next_action_masks_1.to(torch.bool)
             maskn = next_action_masks_n.to(torch.bool)
             gamma = float(self.config.gamma)
-
-            def next_q_value(next_obs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-                if self.base_algo == "ddqn":
-                    q_next_online = self.q(next_obs)
-                    q_next_online = q_next_online.masked_fill(~mask, torch.finfo(q_next_online.dtype).min)
-                    next_actions = torch.argmax(q_next_online, dim=1, keepdim=True)
-
-                    q_next_target = self.q_target(next_obs)
-                    q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
-                    nq = q_next_target.gather(1, next_actions).squeeze(1)
-                else:
-                    q_next_target = self.q_target(next_obs)
-                    q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
-                    nq = q_next_target.max(dim=1).values
-                return torch.where(torch.isfinite(nq), nq, torch.zeros_like(nq))
-
-            next_q1 = next_q_value(next_obs_1, mask1)
-            target1 = rewards_1 + (1.0 - dones_1) * (float(gamma) * next_q1)
-
-            next_qn = next_q_value(next_obs_n, maskn)
             gamma_n = torch.pow(
                 torch.tensor(gamma, device=self.device, dtype=torch.float32), n_steps_n.to(torch.float32)
             )
-            targetn = rewards_n + (1.0 - dones_n) * (gamma_n * next_qn)
+
+            if nq > 1:
+                # QR-DQN: per-quantile targets for both 1-step and n-step.
+                nq1 = self._next_q_quantiles(next_obs_1, mask1, nq)
+                target1_q = rewards_1.unsqueeze(1) + (1.0 - dones_1.unsqueeze(1)) * (float(gamma) * nq1)
+                nqn = self._next_q_quantiles(next_obs_n, maskn, nq)
+                targetn_q = rewards_n.unsqueeze(1) + (1.0 - dones_n.unsqueeze(1)) * (gamma_n.unsqueeze(1) * nqn)
+            else:
+                def _scalar_next_q(next_obs: torch.Tensor, msk: torch.Tensor) -> torch.Tensor:
+                    if self.base_algo == "ddqn":
+                        qno = self._q_values(self.q(next_obs))
+                        qno = qno.masked_fill(~msk, torch.finfo(qno.dtype).min)
+                        na = torch.argmax(qno, dim=1, keepdim=True)
+                        qnt = self._q_values(self.q_target(next_obs))
+                        qnt = qnt.masked_fill(~msk, torch.finfo(qnt.dtype).min)
+                        nv = qnt.gather(1, na).squeeze(1)
+                    else:
+                        qnt = self._q_values(self.q_target(next_obs))
+                        qnt = qnt.masked_fill(~msk, torch.finfo(qnt.dtype).min)
+                        nv = qnt.max(dim=1).values
+                    return torch.where(torch.isfinite(nv), nv, torch.zeros_like(nv))
+                next_q1 = _scalar_next_q(next_obs_1, mask1)
+                target1 = rewards_1 + (1.0 - dones_1) * (float(gamma) * next_q1)
+                next_qn = _scalar_next_q(next_obs_n, maskn)
+                targetn = rewards_n + (1.0 - dones_n) * (gamma_n * next_qn)
 
         # TD losses (importance-sampled).
         is_w = weights.to(torch.float32).clamp_min(0.0)
-        td_error1 = target1 - q_values
-        td_errorn = targetn - q_values
-        loss1 = (self.loss_fn(q_values, target1) * is_w).mean()
-        lossn = (self.loss_fn(q_values, targetn) * is_w).mean()
+        if nq > 1:
+            loss1 = self._quantile_td_loss(q_quantiles, target1_q, is_w)
+            lossn = self._quantile_td_loss(q_quantiles, targetn_q, is_w)
+            td_error1 = (target1_q.mean(dim=1) - q_values).detach()
+        else:
+            td_error1 = target1 - q_values
+            loss1 = (self.loss_fn(q_values, target1) * is_w).mean()
+            lossn = (self.loss_fn(q_values, targetn) * is_w).mean()
         lambda_n = float(getattr(self.config, "dqfd_lambda_n", 1.0))
         td_loss = loss1 + float(lambda_n) * lossn
 
@@ -651,7 +767,7 @@ class DQNFamilyAgent:
         aux_lambda = float(getattr(self.config, "aux_admissibility_lambda", 0.0))
         aux_adm_loss = torch.tensor(0.0, device=self.device)
         if self.aux_adm_head is not None and aux_lambda > 0.0:
-            aux_logits = self.aux_adm_head(self.q(next_obs_1))
+            aux_logits = self.aux_adm_head(self._q_values(self.q(next_obs_1)))
             aux_target = next_action_masks_1.to(torch.float32)
             aux_bce = F.binary_cross_entropy_with_logits(aux_logits, aux_target, reduction="none")
             aux_adm_loss = (aux_bce * is_w.view(-1, 1)).mean()
