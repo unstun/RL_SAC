@@ -83,6 +83,11 @@
 - 远端 `~/.bashrc` 的 conda init 块必须放在 interactive guard（`case $- in`）之前，否则 SSH 非交互式命令无法找到 conda。
   - 已于 2026-02-21 修复本地与远端（ubuntu-zt）的 `~/.bashrc`，备份为 `~/.bashrc.bak.*`。
 
+12.1.2) **CPU 训练注意事项（已踩坑，硬约束）**
+
+- 训练默认使用 GPU 串行（`--device cuda`）；禁止并行启动多个 CPU 训练进程（会导致 CPU 满载、远端卡死）。
+- 若 GPU 不可用必须用 CPU，只能**串行**逐个运行，不得并发。
+
 12.2) **版本标准工作流（默认）**
 
 - 每次创建新版本（`vxpx`）前，必须先完成 GitHub 快照：`git status` clean、`git add/commit`、`git push` 成功。

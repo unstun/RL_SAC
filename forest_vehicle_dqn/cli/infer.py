@@ -137,6 +137,145 @@ def forest_stop_action(env: AMRBicycleEnv) -> int:
     return int(best_action)
 
 
+def _ensemble_fuse(
+    q_all: list[torch.Tensor],
+    *,
+    mode: str = "qavg",
+    negotiate_k: int = 20,
+    negotiate_k_max: int = 30,
+    negsoft_alpha: float = 0.7,
+    negsoft_tau: float = 0.1,
+) -> torch.Tensor:
+    """Fuse Q-values from multiple ensemble members.
+
+    Modes:
+      qavg — simple Q-value average (baseline)
+      pavg — policy averaging: softmax each → average policies → output as q
+      vote — majority voting: each model argmax → vote → one-hot as q
+      conf — confidence-weighted: weight by inverse entropy of softmax(Q)
+      rank — Borda count: scale-invariant rank fusion
+      qgap — Q-gap weighted: confidence = max-2nd gap (better than entropy)
+      veto — primary-first: trust DDQN unless M-DQN vetoes → fallback conf
+      topk — primary top-K filtered: DDQN proposes, secondary picks
+    """
+    stacked = torch.stack(q_all)  # (N, n_actions)
+    if mode == "qavg":
+        return stacked.mean(dim=0)
+    elif mode == "pavg":
+        tau = 0.03
+        policies = torch.softmax(stacked / tau, dim=1)  # (N, n_actions)
+        avg_policy = policies.mean(dim=0)  # (n_actions,)
+        return avg_policy
+    elif mode == "vote":
+        n_actions = stacked.shape[1]
+        votes = torch.zeros(n_actions, device=stacked.device)
+        for q_i in q_all:
+            votes[int(torch.argmax(q_i).item())] += 1.0
+        return votes
+    elif mode == "conf":
+        tau = 0.03
+        policies = torch.softmax(stacked / tau, dim=1)  # (N, n_actions)
+        entropy = -(policies * torch.log(policies + 1e-8)).sum(dim=1)  # (N,)
+        weights = 1.0 / (entropy + 1e-6)  # (N,)
+        weights = weights / weights.sum()
+        return (weights.unsqueeze(1) * stacked).sum(dim=0)
+    elif mode == "rank":
+        # Borda count: scale-invariant rank fusion
+        n_models, n_actions = stacked.shape
+        ranks = torch.zeros_like(stacked)
+        for i in range(n_models):
+            order = torch.argsort(stacked[i], descending=True)
+            r = torch.zeros(n_actions, device=stacked.device, dtype=stacked.dtype)
+            r[order] = torch.arange(n_actions, device=stacked.device, dtype=stacked.dtype)
+            ranks[i] = r
+        return -(ranks.sum(dim=0))  # negate: argmax picks lowest rank
+    elif mode == "qgap":
+        # Q-gap weighted: confidence = gap between top-2 Q-values
+        sorted_q, _ = torch.sort(stacked, dim=1, descending=True)
+        gaps = sorted_q[:, 0] - sorted_q[:, 1]  # (N,)
+        weights = gaps / (gaps.sum() + 1e-8)
+        return (weights.unsqueeze(1) * stacked).sum(dim=0)
+    elif mode == "veto":
+        # Primary-first with safety net: trust primary unless secondary vetoes
+        primary_q = q_all[0]
+        best_a = int(torch.argmax(primary_q).item())
+        veto_k = 10
+        vetoed = False
+        for q_i in q_all[1:]:
+            topk_idx = torch.topk(q_i, min(veto_k, q_i.shape[0])).indices
+            if best_a not in topk_idx.tolist():
+                vetoed = True
+                break
+        if not vetoed:
+            return primary_q
+        return _ensemble_fuse(q_all, mode="conf")
+    elif mode == "topk":
+        # Primary proposes top-K, secondary picks best among them
+        primary_q = q_all[0]
+        k, n_a = 10, primary_q.shape[0]
+        _, topk_idx = torch.topk(primary_q, min(k, n_a))
+        topk_set = set(topk_idx.tolist())
+        if len(q_all) <= 1:
+            return primary_q
+        sec_stack = torch.stack(q_all[1:])
+        sec_avg = sec_stack.mean(dim=0)
+        result = torch.full((n_a,), float('-inf'), device=stacked.device)
+        for a in topk_set:
+            result[a] = sec_avg[a]
+        return result
+    elif mode == "negotiate":
+        # DDQN proposes by rank, M-DQN approves/vetoes, iterate until agreed
+        primary_q = q_all[0]
+        approve_k = negotiate_k  # secondary approves if action is in its top-K
+        secondary_topk = []
+        for q_i in q_all[1:]:
+            topk_idx = torch.topk(q_i, min(approve_k, q_i.shape[0])).indices
+            secondary_topk.append(set(topk_idx.tolist()))
+        primary_order = torch.argsort(primary_q, descending=True).tolist()
+        for a in primary_order:
+            if all(a in s for s in secondary_topk):
+                result = primary_q.clone()
+                result[a] = primary_q.max() + 1.0  # boost negotiated action
+                return result
+        return primary_q  # no agreement → trust primary
+    elif mode == "negrelax":
+        # Progressive relaxation: try K_min, K_min+5, ..., K_max
+        primary_q = q_all[0]
+        n_actions = primary_q.shape[0]
+        k_min = negotiate_k
+        k_max = min(negotiate_k_max, n_actions)
+        primary_order = torch.argsort(primary_q, descending=True).tolist()
+        for current_k in range(k_min, k_max + 1, 5):
+            secondary_topk = []
+            for q_i in q_all[1:]:
+                topk_idx = torch.topk(q_i, min(current_k, n_actions)).indices
+                secondary_topk.append(set(topk_idx.tolist()))
+            for a in primary_order:
+                if all(a in s for s in secondary_topk):
+                    result = primary_q.clone()
+                    result[a] = primary_q.max() + 1.0
+                    return result
+        return primary_q  # all relaxation failed → trust primary
+    elif mode == "negsoft":
+        # Soft-vote negotiate: rank(DDQN) + softmax(M-DQN) weighted sum
+        primary_q = q_all[0]
+        n = primary_q.shape[0]
+        primary_order = torch.argsort(primary_q, descending=True)
+        primary_score = torch.zeros(n, device=primary_q.device, dtype=primary_q.dtype)
+        primary_score[primary_order] = torch.arange(
+            n - 1, -1, -1, device=primary_q.device, dtype=primary_q.dtype
+        )
+        sec_score = torch.zeros(n, device=primary_q.device, dtype=primary_q.dtype)
+        for q_i in q_all[1:]:
+            sec_score += torch.softmax(q_i / negsoft_tau, dim=0)
+        sec_score /= max(len(q_all) - 1, 1)
+        sec_score *= n  # scale to same range as primary_score
+        combined = negsoft_alpha * primary_score + (1.0 - negsoft_alpha) * sec_score
+        return combined
+    else:
+        raise ValueError(f"Unknown ensemble_mode: {mode!r}")
+
+
 def rollout_agent(
     env: gym.Env,
     agent: DQNFamilyAgent,
@@ -147,12 +286,20 @@ def rollout_agent(
     time_mode: str = "rollout",
     obs_transform: Callable[[np.ndarray], np.ndarray] | None = None,
     forest_adm_horizon: int = 15,
+    forest_adm_persistence: int = 0,
     forest_topk: int = 10,
     forest_min_od_m: float = 0.0,
     forest_min_progress_m: float = 1e-4,
     forest_no_fallback: bool = False,
     collect_controls: bool = False,
     trace_path: Path | None = None,
+    ensemble_agents: list[DQNFamilyAgent] | None = None,
+    ensemble_mode: str = "qavg",
+    negotiate_k: int = 20,
+    negotiate_k_max: int = 30,
+    negsoft_alpha: float = 0.7,
+    negsoft_tau: float = 0.1,
+    ensemble_adm_prefilter: bool = False,
 ) -> RolloutResult:
     obs, info0 = env.reset(seed=seed, options=reset_options)
     if obs_transform is not None:
@@ -225,7 +372,9 @@ def rollout_agent(
     replacement_mask_steps = 0
     fallback_steps = 0
     stop_override_steps = 0
+    prefilter_active_steps = 0
     adm_h = max(1, int(forest_adm_horizon))
+    adm_p = max(0, int(forest_adm_persistence))
     topk_k = max(1, int(forest_topk))
     strict_no_fallback = bool(forest_no_fallback)
     min_od = float(forest_min_od_m)
@@ -255,13 +404,43 @@ def rollout_agent(
                 # - strict_no_fallback=False: keep admissibility-gated replacement logic.
                 with torch.no_grad():
                     x = torch.from_numpy(obs.astype(np.float32, copy=False)).to(agent.device)
-                    q = agent._q_values(agent.q(x.unsqueeze(0))).squeeze(0)
+                    x_batch = x.unsqueeze(0)
+                    q_primary = agent._q_values(agent.q(x_batch)).squeeze(0)
+                    if ensemble_agents:
+                        q_all = [q_primary]
+                        for _ea in ensemble_agents:
+                            q_i = _ea._q_values(_ea.q(x_batch.to(_ea.device))).squeeze(0)
+                            q_all.append(q_i.to(agent.device))
+                        # V24: pre-filter inadmissible actions before fusion
+                        if ensemble_adm_prefilter and isinstance(env, AMRBicycleEnv):
+                            _pf_mask = env.admissible_action_mask(
+                                horizon_steps=adm_h, min_od_m=min_od,
+                                min_progress_m=min_prog, fallback_to_safe=True,
+                                action_persistence=int(adm_p),
+                            )
+                            _pf_t = torch.from_numpy(_pf_mask).to(q_primary.device)
+                            if _pf_t.any():
+                                _neg_inf = torch.finfo(q_primary.dtype).min
+                                for _qi in range(len(q_all)):
+                                    q_all[_qi] = q_all[_qi].clone()
+                                    q_all[_qi][~_pf_t] = _neg_inf
+                                prefilter_active_steps += 1
+                        q = _ensemble_fuse(
+                            q_all,
+                            mode=ensemble_mode,
+                            negotiate_k=negotiate_k,
+                            negotiate_k_max=negotiate_k_max,
+                            negsoft_alpha=negsoft_alpha,
+                            negsoft_tau=negsoft_tau,
+                        )
+                    else:
+                        q = q_primary
 
                 a0 = int(torch.argmax(q).item())
                 a = int(a0)
 
                 a0_adm = bool(
-                    env.is_action_admissible(int(a0), horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog)
+                    env.is_action_admissible(int(a0), horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog, action_persistence=int(adm_p))
                 )
                 if not a0_adm:
                     argmax_inadmissible_steps += 1
@@ -275,7 +454,7 @@ def rollout_agent(
                             continue
                         if bool(
                             env.is_action_admissible(
-                                cand_i, horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog
+                                cand_i, horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog, action_persistence=int(adm_p)
                             )
                         ):
                             chosen = int(cand_i)
@@ -290,6 +469,7 @@ def rollout_agent(
                             min_od_m=min_od,
                             min_progress_m=min_prog,
                             fallback_to_safe=False,
+                            action_persistence=int(adm_p),
                         )
                         if bool(prog_mask.any()):
                             q_masked = q.clone()
@@ -371,6 +551,7 @@ def rollout_agent(
         "replacement_mask_steps": int(replacement_mask_steps),
         "fallback_steps": int(fallback_steps),
         "stop_override_steps": int(stop_override_steps),
+        "prefilter_active_steps": int(prefilter_active_steps),
         "argmax_inadmissible_rate": float(argmax_inadmissible_steps) / float(steps_safe),
         "fallback_rate": float(fallback_steps) / float(steps_safe),
         "failure_reason": str(failure_reason),
@@ -426,6 +607,109 @@ def _estimate_path_yaw_rad(path_xy_cells: list[tuple[float, float]]) -> list[flo
         out.append(float(yaw))
         prev = float(yaw)
     return out
+
+
+def rollout_td3_local(
+    env: AMRBicycleEnv,
+    agent,  # TD3Agent with local encoder
+    *,
+    max_steps: int,
+    seed: int,
+    reset_options: dict | None = None,
+    time_mode: str = "rollout",
+    collect_controls: bool = False,
+) -> RolloutResult:
+    """Rollout TD3-local with V16-C flat obs + continuous actions."""
+    obs_raw, info0 = env.reset(seed=seed, options=reset_options)
+    obs = env._observe()  # flat 154-dim
+    path: list[tuple[float, float]] = []
+    dt_s = float(env.model.dt)
+
+    t_series: list[float] | None = None
+    v_series: list[float] | None = None
+    delta_series: list[float] | None = None
+    if collect_controls:
+        t_series = [0.0]
+        v_series = [float(env._v_m_s)]
+        delta_series = [float(env._delta_rad)]
+
+    inference_time_s = 0.0
+    if agent.device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t_rollout0 = time.perf_counter()
+    done = False
+    truncated = False
+    steps = 0
+    last_collision = False
+    last_stuck = False
+    info: dict = {}
+
+    while not (done or truncated) and steps < max_steps:
+        steps += 1
+        if time_mode == "policy":
+            if agent.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        action = agent.act_flat(obs, explore=False)  # deterministic
+
+        if time_mode == "policy":
+            if agent.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            inference_time_s += time.perf_counter() - t0
+
+        delta_dot = float(action[0]) * float(env.model.delta_dot_max_rad_s)
+        accel = float(action[1]) * float(env.model.a_max_m_s2)
+        _, reward, done, truncated, info = env.step_continuous(
+            delta_dot_rad_s=delta_dot, a_m_s2=accel)
+        obs = env._observe()
+
+        ax, ay = env._agent_xy_for_plot()
+        path.append((float(ax), float(ay)))
+        last_collision = bool(info.get("collision", False))
+        last_stuck = bool(info.get("stuck", False))
+
+        if collect_controls and t_series is not None:
+            t_series.append(float(steps) * dt_s)
+            v_series.append(float(info.get("v_m_s", 0.0)))
+            delta_series.append(float(info.get("delta_rad", 0.0)))
+
+    if time_mode == "rollout":
+        if agent.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_time_s = time.perf_counter() - t_rollout0
+
+    reached = bool(info.get("reached", False)) if steps > 0 else False
+    path_time_s = float(steps) * dt_s
+
+    controls = None
+    if collect_controls and t_series is not None:
+        controls = ControlTrace(
+            t_s=np.array(t_series), v_m_s=np.array(v_series),
+            delta_rad=np.array(delta_series))
+
+    failure_reason = "success"
+    if not reached:
+        if last_collision:
+            failure_reason = "collision"
+        elif last_stuck:
+            failure_reason = "stuck"
+        elif truncated or steps >= max_steps:
+            failure_reason = "timeout"
+        else:
+            failure_reason = "unknown"
+
+    return RolloutResult(
+        path_xy_cells=path,
+        compute_time_s=inference_time_s,
+        reached=reached,
+        steps=steps,
+        path_time_s=path_time_s,
+        controls=controls,
+        collision=last_collision,
+        truncated=truncated,
+        debug={"failure_reason": failure_reason},
+    )
 
 
 def rollout_sac(
@@ -701,6 +985,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model source: experiment name/dir, run dir, or models dir.",
     )
     ap.add_argument(
+        "--ensemble-models",
+        type=Path,
+        nargs="*",
+        default=None,
+        help="Additional model dirs for Q-value ensemble averaging (Averaged-DQN).",
+    )
+    ap.add_argument(
+        "--ensemble-mode",
+        type=str,
+        default="qavg",
+        choices=["qavg", "pavg", "vote", "conf", "rank", "qgap", "veto", "topk", "negotiate", "negrelax", "negsoft"],
+        help="Ensemble fusion: qavg|pavg|vote|conf|rank|qgap|veto|topk|negotiate|negrelax|negsoft.",
+    )
+    ap.add_argument(
+        "--negotiate-k",
+        type=int,
+        default=20,
+        help="Top-K approval threshold for negotiate mode (default: 20).",
+    )
+    ap.add_argument(
+        "--negotiate-k-max",
+        type=int,
+        default=30,
+        help="Max K for negrelax progressive relaxation (default: 30).",
+    )
+    ap.add_argument(
+        "--negsoft-alpha",
+        type=float,
+        default=0.7,
+        help="DDQN rank weight for negsoft mode; 0=pure M-DQN, 1=pure DDQN (default: 0.7).",
+    )
+    ap.add_argument(
+        "--negsoft-tau",
+        type=float,
+        default=0.1,
+        help="Softmax temperature for M-DQN approval in negsoft mode (default: 0.1).",
+    )
+    ap.add_argument(
+        "--ensemble-adm-prefilter",
+        action="store_true",
+        default=False,
+        help="Pre-filter inadmissible actions before ensemble fusion (V24).",
+    )
+    ap.add_argument(
         "--out",
         type=Path,
         default=Path("outputs"),
@@ -820,6 +1148,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Downsampled global-map observation size (applies to both grid and forest envs).",
     )
     ap.add_argument(
+        "--obs-geodesic-goal-dist",
+        action="store_true",
+        default=False,
+        help="Add a geodesic (Dijkstra) goal-distance channel to the map observation.",
+    )
+    ap.add_argument(
         "--goal-tolerance-m",
         type=float,
         default=1.0,
@@ -919,6 +1253,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=15,
         help="Forest-only: admissible-action horizon steps for safe/progress-gated rollouts.",
+    )
+    ap.add_argument(
+        "--forest-adm-persistence",
+        type=int,
+        default=0,
+        help="Forest-only: action persistence steps before decay (0=no decay, full constant rollout).",
     )
     ap.add_argument(
         "--forest-goal-admissible-relax-factor",
@@ -1307,17 +1647,17 @@ def main(argv: list[str] | None = None) -> int:
     forest_envs = set(FOREST_ENV_ORDER)
     if int(args.max_steps) == 300 and args.envs and all(str(e) in forest_envs for e in args.envs):
         args.max_steps = 600
-    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-sac")
+    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "cnn-sac", "cnn-td3", "cnn-td3-local")
     raw_algos = [str(a).lower().strip() for a in (args.rl_algos or [])]
     if any(a == "all" for a in raw_algos):
-        raw_algos = list(canonical_all[:-1])  # exclude cnn-sac from "all"
+        raw_algos = list(canonical_all[:-3])  # exclude cnn-sac, cnn-td3, cnn-td3-local from "all"
 
     rl_algos: list[str] = []
     unknown = []
     for a in raw_algos:
-        if a == "cnn-sac":
-            if "cnn-sac" not in rl_algos:
-                rl_algos.append("cnn-sac")
+        if a in ("cnn-sac", "cnn-td3", "cnn-td3-local"):
+            if a not in rl_algos:
+                rl_algos.append(a)
             continue
         try:
             canonical, _arch, _base, _legacy = parse_rl_algo(a)
@@ -1512,6 +1852,8 @@ def main(argv: list[str] | None = None) -> int:
     for k, v in vars(args).items():
         if isinstance(v, Path):
             args_payload[k] = str(v)
+        elif isinstance(v, list) and v and isinstance(v[0], Path):
+            args_payload[k] = [str(p) for p in v]
         else:
             args_payload[k] = v
     (out_dir / "configs" / "run.json").write_text(
@@ -1568,6 +1910,7 @@ def main(argv: list[str] | None = None) -> int:
                 sensor_range_m=float(args.sensor_range),
                 n_sectors=args.n_sectors,
                 obs_map_size=int(args.obs_map_size),
+                obs_geodesic_goal_dist=bool(getattr(args, "obs_geodesic_goal_dist", False)),
                 goal_tolerance_m=float(args.goal_tolerance_m),
                 goal_angle_tolerance_deg=float(args.goal_angle_tolerance_deg),
                 goal_stop_speed_m_s=float(args.goal_stop_speed_m_s),
@@ -1888,6 +2231,7 @@ def main(argv: list[str] | None = None) -> int:
                         reset_options={"start_xy": start_xy, "goal_xy": goal_xy},
                         time_mode="rollout",
                         forest_adm_horizon=int(args.forest_adm_horizon),
+                        forest_adm_persistence=int(args.forest_adm_persistence),
                         forest_topk=int(args.forest_topk),
                         forest_min_od_m=float(args.forest_min_od_m),
                         forest_min_progress_m=float(args.forest_min_progress_m),
@@ -2001,7 +2345,11 @@ def main(argv: list[str] | None = None) -> int:
                 "cnn-dqn": "CNN-DQN",
                 "cnn-ddqn": "CNN-DDQN",
                 "cnn-pddqn": "CNN-PDDQN",
+                "mlp-mdqn": "MLP-MDQN",
+                "cnn-mdqn": "CNN-MDQN",
                 "cnn-sac": "CNN-SAC",
+                "cnn-td3": "CNN-TD3",
+                "cnn-td3-local": "CNN-TD3-Local",
             }
             algo_seed_offset = {
                 "mlp-dqn": 20_000,
@@ -2010,7 +2358,11 @@ def main(argv: list[str] | None = None) -> int:
                 "cnn-dqn": 40_000,
                 "cnn-ddqn": 50_000,
                 "cnn-pddqn": 70_000,
+                "mlp-mdqn": 90_000,
+                "cnn-mdqn": 100_000,
                 "cnn-sac": 80_000,
+                "cnn-td3": 110_000,
+                "cnn-td3-local": 120_000,
             }
 
             def resolve_model_path(algo: str) -> Path:
@@ -2040,7 +2392,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             # Check obs_dim consistency (skip SAC checkpoints which have different format)
-            dqn_algo_paths = {a: p for a, p in algo_paths.items() if str(a) != "cnn-sac"}
+            dqn_algo_paths = {a: p for a, p in algo_paths.items() if str(a) not in ("cnn-sac", "cnn-td3", "cnn-td3-local")}
             if dqn_algo_paths:
                 ckpt_obs_dim = infer_checkpoint_obs_dim(next(iter(dqn_algo_paths.values())))
                 for path in dqn_algo_paths.values():
@@ -2072,10 +2424,46 @@ def main(argv: list[str] | None = None) -> int:
                     sa.load(path)
                     sac_agents[str(algo)] = sa
                     agents[str(algo)] = sa
+                elif str(algo) == "cnn-td3":
+                    from forest_vehicle_dqn.td3_agent import TD3Agent, TD3Config
+                    td3_cfg = TD3Config(
+                        map_size=int(getattr(args, "global_map_size", 48)),
+                        map_channels=3, scalar_dim=12,
+                    )
+                    ta = TD3Agent(td3_cfg, device=str(device), seed=args.seed)
+                    ta.load(path)
+                    sac_agents[str(algo)] = ta
+                    agents[str(algo)] = ta
+                elif str(algo) == "cnn-td3-local":
+                    from forest_vehicle_dqn.td3_agent import TD3Agent, TD3Config
+                    obs_map_size_local = int(getattr(args, "obs_map_size", 12))
+                    td3l_cfg = TD3Config(
+                        map_size=obs_map_size_local, map_channels=1,
+                        scalar_dim=10, use_local_encoder=True,
+                    )
+                    tl = TD3Agent(td3l_cfg, device=str(device), seed=args.seed)
+                    tl.load(path)
+                    agents[str(algo)] = tl  # stored separately, not in sac_agents
                 else:
                     a = DQNFamilyAgent(str(algo), obs_dim, n_actions, config=agent_cfg, seed=args.seed, device=device)
                     a.load(path)
                     agents[str(algo)] = a
+
+            # --- Ensemble model loading (Averaged-DQN / heterogeneous ensemble) ---
+            _ENS_ALGOS = ["cnn-dqn", "cnn-ddqn", "cnn-mdqn", "cnn-pddqn"]
+            ensemble_agents_map: dict[str, list[DQNFamilyAgent]] = {}
+            if args.ensemble_models:
+                primary_algo = str(args.rl_algos[0]) if args.rl_algos else "cnn-ddqn"
+                for ens_src in args.ensemble_models:
+                    ens_dir = resolve_models_dir(ens_src, runs_root=args.runs_root)
+                    for ens_algo in _ENS_ALGOS:
+                        ens_path = ens_dir / env_base / f"{ens_algo}.pt"
+                        if ens_path.exists():
+                            ea = DQNFamilyAgent(ens_algo, obs_dim, n_actions, config=agent_cfg, seed=args.seed, device=device)
+                            ea.load(ens_path)
+                            ensemble_agents_map.setdefault(primary_algo, []).append(ea)
+                n_ens = sum(len(v) for v in ensemble_agents_map.values())
+                progress_write(f"[infer] Loaded {n_ens} ensemble model(s) from {len(args.ensemble_models)} dir(s)")
 
             for algo in args.rl_algos:
                 algo_key = str(algo)
@@ -2103,7 +2491,17 @@ def main(argv: list[str] | None = None) -> int:
                     trace_path = None
                     if bool(getattr(args, "forest_policy_save_traces", False)) and isinstance(env, AMRBicycleEnv):
                         trace_path = out_dir / "traces" / f"{_safe_slug(env_case)}__{_safe_slug(pretty)}__run{int(i)}.csv"
-                    if algo_key in sac_agents and isinstance(env, AMRBicycleEnv):
+                    if algo_key == "cnn-td3-local" and isinstance(env, AMRBicycleEnv):
+                        roll = rollout_td3_local(
+                            env,
+                            agents[algo_key],
+                            max_steps=args.max_steps,
+                            seed=int(args.seed) + seed_base + int(i),
+                            reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
+                            time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
+                            collect_controls=bool(int(i) in control_run_indices),
+                        )
+                    elif algo_key in sac_agents and isinstance(env, AMRBicycleEnv):
                         roll = rollout_sac(
                             env,
                             sac_agents[algo_key],
@@ -2124,12 +2522,20 @@ def main(argv: list[str] | None = None) -> int:
                             time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
                             obs_transform=obs_transform,
                             forest_adm_horizon=int(args.forest_adm_horizon),
+                            forest_adm_persistence=int(args.forest_adm_persistence),
                             forest_topk=int(args.forest_topk),
                             forest_min_od_m=float(args.forest_min_od_m),
                             forest_min_progress_m=float(args.forest_min_progress_m),
                             forest_no_fallback=bool(getattr(args, "forest_no_fallback", False)),
                             collect_controls=bool(int(i) in control_run_indices),
                             trace_path=trace_path,
+                            ensemble_agents=ensemble_agents_map.get(algo_key),
+                            ensemble_mode=str(getattr(args, "ensemble_mode", "qavg")),
+                            negotiate_k=int(getattr(args, "negotiate_k", 20)),
+                            negotiate_k_max=int(getattr(args, "negotiate_k_max", 30)),
+                            negsoft_alpha=float(getattr(args, "negsoft_alpha", 0.7)),
+                            negsoft_tau=float(getattr(args, "negsoft_tau", 0.1)),
+                            ensemble_adm_prefilter=bool(getattr(args, "ensemble_adm_prefilter", False)),
                         )
                     algo_times.append(float(roll.compute_time_s))
                     if int(i) in path_run_indices:

@@ -130,6 +130,8 @@ def plot_training_eval_metrics(df_eval: pd.DataFrame, *, out_path: Path) -> None
         "cnn-dqn": "CNN-DQN",
         "cnn-ddqn": "CNN-DDQN",
         "cnn-pddqn": "CNN-PDDQN",
+        "mlp-mdqn": "MLP-MDQN",
+        "cnn-mdqn": "CNN-MDQN",
         # Legacy (older runs)
         "dqn": "DQN",
         "ddqn": "DDQN",
@@ -137,7 +139,7 @@ def plot_training_eval_metrics(df_eval: pd.DataFrame, *, out_path: Path) -> None
         "cnn-iddqn": "CNN-PDDQN",
     }
     present = [str(x) for x in df_eval["algo"].dropna().drop_duplicates().tolist()]
-    pref = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "dqn", "ddqn")
+    pref = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "dqn", "ddqn")
     ordered = [a for a in pref if a in present] + [a for a in present if a not in pref]
     algo_defs: list[tuple[str, str]] = [(a, algo_label.get(a, a.upper())) for a in ordered]
     for i, env_name in enumerate(envs):
@@ -298,9 +300,11 @@ def _forest_policy_action_from_q(
     forest_min_od_m: float,
     forest_min_progress_m: float,
     forest_no_fallback: bool,
+    forest_adm_persistence: int = 0,
 ) -> tuple[int, bool]:
     """Infer-style forest policy action from Q values; returns (action, argmax_inadmissible)."""
     adm_h = max(1, int(forest_adm_horizon))
+    adm_p = max(0, int(forest_adm_persistence))
     topk_k = max(1, int(forest_topk))
     strict_no_fallback = bool(forest_no_fallback)
     min_od = float(forest_min_od_m)
@@ -325,6 +329,7 @@ def _forest_policy_action_from_q(
             horizon_steps=int(adm_h),
             min_od_m=float(min_od),
             min_progress_m=float(min_prog),
+            action_persistence=int(adm_p),
         )
     )
 
@@ -342,6 +347,7 @@ def _forest_policy_action_from_q(
                     horizon_steps=int(adm_h),
                     min_od_m=float(min_od),
                     min_progress_m=float(min_prog),
+                    action_persistence=int(adm_p),
                 )
             ):
                 chosen = int(cand_i)
@@ -353,6 +359,7 @@ def _forest_policy_action_from_q(
                 min_od_m=float(min_od),
                 min_progress_m=float(min_prog),
                 fallback_to_safe=False,
+                action_persistence=int(adm_p),
             )
             if bool(prog_mask.any()):
                 q_masked = q.clone()
@@ -507,6 +514,7 @@ def _eval_train_progress_suites(
     seed_base: int,
     max_steps: int,
     adm_horizon: int,
+    adm_persistence: int = 0,
     topk: int,
     min_od_m: float,
     min_progress_m: float,
@@ -559,6 +567,7 @@ def _eval_train_progress_suites(
                     forest_min_od_m=float(min_od_m),
                     forest_min_progress_m=float(min_progress_m),
                     forest_no_fallback=bool(forest_no_fallback),
+                    forest_adm_persistence=int(adm_persistence),
                 )
             decision_steps += 1
             if bool(argmax_inadmissible):
@@ -656,6 +665,7 @@ def collect_forest_demos(
     forest_expert: str,
     forest_demo_horizon: int,
     forest_adm_horizon: int,
+    forest_adm_persistence: int = 0,
     forest_min_od_m: float,
     forest_min_progress_m: float,
     forest_use_admissible_next_mask: bool,
@@ -691,6 +701,7 @@ def collect_forest_demos(
     added = 0
     demo_ep = 0
     adm_h = max(1, int(forest_adm_horizon))
+    adm_p = max(0, int(forest_adm_persistence))
     min_od_m = float(forest_min_od_m)
     min_prog_m = float(forest_min_progress_m)
     use_adm_next_mask = bool(forest_use_admissible_next_mask)
@@ -804,6 +815,7 @@ def collect_forest_demos(
                     min_od_m=float(min_od_m),
                     min_progress_m=min_prog_m,
                     fallback_to_safe=True,
+                    action_persistence=int(adm_p),
                 )
                 if use_adm_next_mask
                 else full_next_mask
@@ -930,6 +942,7 @@ def train_one(
     forest_expert_exploration: bool,
     forest_action_shield: bool,
     forest_adm_horizon: int,
+    forest_adm_persistence: int = 0,
     forest_topk: int,
     forest_min_od_m: float,
     forest_min_progress_m: float,
@@ -1003,6 +1016,7 @@ def train_one(
     run_label = f"{env.map_spec.name}/{algo}"
     t_train_one_start = time.perf_counter()
     adm_h = max(1, int(forest_adm_horizon))
+    adm_p = max(0, int(forest_adm_persistence))
     topk_k = max(1, int(forest_topk))
     min_od_m = float(forest_min_od_m)
     min_prog_m = float(forest_min_progress_m)
@@ -1241,6 +1255,7 @@ def train_one(
                 forest_min_od_m=float(min_od_m),
                 forest_min_progress_m=float(min_prog_m),
                 forest_no_fallback=bool(strict_no_fallback),
+                forest_adm_persistence=int(adm_p),
             )
         return int(agent.act(obs_eval, episode=0, explore=False)), False
 
@@ -1323,6 +1338,7 @@ def train_one(
                         min_od_m=float(min_od_m),
                         min_progress_m=min_prog_m,
                         fallback_to_safe=True,
+                        action_persistence=int(adm_p),
                     )
                     reached = bool(reached or bool(info.get("reached", False)))
                     ep.append((obs, int(a), float(reward), next_obs, bool(done), bool(truncated), next_mask))
@@ -1606,6 +1622,7 @@ def train_one(
             seed_base=int(train_eval_seed_base),
             max_steps=int(eval_max_steps),
             adm_horizon=int(adm_h),
+            adm_persistence=int(adm_p),
             topk=int(topk_k),
             min_od_m=float(min_od_m),
             min_progress_m=float(min_prog_m),
@@ -1752,6 +1769,7 @@ def train_one(
                 min_od_m=float(min_od_m),
                 min_progress_m=min_prog_m,
                 fallback_to_safe=True,
+                action_persistence=int(adm_p),
             )
             if bool(mask0.any()):
                 action_mask = mask0
@@ -1823,6 +1841,7 @@ def train_one(
                         horizon_steps=int(adm_h),
                         min_od_m=float(min_od_m),
                         min_progress_m=float(min_prog_m),
+                        action_persistence=int(adm_p),
                     )
                 )
                 if bool(inadmissible):
@@ -1837,6 +1856,7 @@ def train_one(
                             forest_min_od_m=float(min_od_m),
                             forest_min_progress_m=float(min_prog_m),
                             forest_no_fallback=bool(strict_no_fallback),
+                            forest_adm_persistence=int(adm_p),
                         )
             action_decisions += 1
             next_obs, reward, done, truncated, info = env.step(action)
@@ -1863,6 +1883,7 @@ def train_one(
                         min_od_m=float(min_od_m),
                         min_progress_m=min_prog_m,
                         fallback_to_safe=True,
+                        action_persistence=int(adm_p),
                     )
                     next_mask = next_mask_raw if bool(next_mask_raw.any()) else full_action_mask
                     action_mask = next_mask_raw if bool(next_mask_raw.any()) else None
@@ -1872,6 +1893,7 @@ def train_one(
                         min_od_m=float(min_od_m),
                         min_progress_m=min_prog_m,
                         fallback_to_safe=True,
+                        action_persistence=int(adm_p),
                     )
                     if action_mask is not None:
                         action_mask = next_mask
@@ -2384,6 +2406,7 @@ def train_one_sac(
     progress: bool = True,
     device: torch.device = torch.device("cpu"),
     flow_log_fp: "TextIO | None" = None,
+    agent_override: object | None = None,
 ) -> tuple[object, np.ndarray, list, dict]:
     """Simplified SAC training loop for continuous-action forest navigation."""
     from forest_vehicle_dqn.sac_agent import SACAgent, SACConfig
@@ -2394,35 +2417,43 @@ def train_one_sac(
         if progress_write is not None:
             progress_write(str(msg))
 
-    sac_config = SACConfig(
-        map_size=int(global_map_size),
-        map_channels=int(sac_cfg_dict.get("global_map_channels", 3)),
-        scalar_dim=12,
-        action_dim=2,
-        hidden_dim=int(sac_cfg_dict.get("sac_hidden_dim", 256)),
-        gamma=float(sac_cfg_dict.get("gamma", 0.99)),
-        tau=float(sac_cfg_dict.get("sac_tau", 0.005)),
-        lr_actor=float(sac_cfg_dict.get("sac_lr_actor", 3e-4)),
-        lr_critic=float(sac_cfg_dict.get("sac_lr_critic", 3e-4)),
-        lr_alpha=float(sac_cfg_dict.get("sac_lr_alpha", 3e-4)),
-        batch_size=int(sac_cfg_dict.get("sac_batch_size", 256)),
-        buffer_size=int(sac_cfg_dict.get("sac_buffer_size", 1_000_000)),
-        target_entropy=float(sac_cfg_dict.get("sac_target_entropy", -2.0)),
-        reward_scale=float(sac_cfg_dict.get("sac_reward_scale", 0.01)),
-        grad_clip_norm=float(sac_cfg_dict.get("sac_grad_clip_norm", 1.0)),
-        reward_clip_min=float(sac_cfg_dict.get("sac_reward_clip_min", -500.0)),
-        reward_clip_max=float(sac_cfg_dict.get("sac_reward_clip_max", 1100.0)),
-        target_q_min=float(sac_cfg_dict.get("sac_target_q_min", -50.0)),
-        target_q_max=float(sac_cfg_dict.get("sac_target_q_max", 50.0)),
-        use_huber_loss=bool(sac_cfg_dict.get("sac_use_huber_loss", True)),
-        critic_warmup_steps=int(sac_cfg_dict.get("sac_critic_warmup_steps", 2000)),
-        use_tecrl=bool(use_tecrl or sac_cfg_dict.get("sac_use_tecrl", False)),
-        lr_entropy_critic=float(sac_cfg_dict.get("sac_lr_entropy_critic", lr_entropy_critic)),
-        entropy_budget_ratio=float(sac_cfg_dict.get("sac_entropy_budget_ratio", entropy_budget_ratio)),
-        alpha_min=float(sac_cfg_dict.get("sac_alpha_min", alpha_min)),
-    )
-    agent = SACAgent(sac_config, device=str(device), seed=seed)
-    log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
+    # Allow pre-constructed agent (for TD3 reuse)
+    if agent_override is not None:
+        agent = agent_override
+        sac_config = None
+        log(f"[train] Using pre-constructed agent: {type(agent).__name__}")
+    else:
+        sac_config = SACConfig(
+            map_size=int(global_map_size),
+            map_channels=int(sac_cfg_dict.get("global_map_channels", 3)),
+            scalar_dim=12,
+            action_dim=2,
+            hidden_dim=int(sac_cfg_dict.get("sac_hidden_dim", 256)),
+            gamma=float(sac_cfg_dict.get("gamma", 0.99)),
+            tau=float(sac_cfg_dict.get("sac_tau", 0.005)),
+            lr_actor=float(sac_cfg_dict.get("sac_lr_actor", 3e-4)),
+            lr_critic=float(sac_cfg_dict.get("sac_lr_critic", 3e-4)),
+            lr_alpha=float(sac_cfg_dict.get("sac_lr_alpha", 3e-4)),
+            batch_size=int(sac_cfg_dict.get("sac_batch_size", 256)),
+            buffer_size=int(sac_cfg_dict.get("sac_buffer_size", 1_000_000)),
+            target_entropy=float(sac_cfg_dict.get("sac_target_entropy", -2.0)),
+            reward_scale=float(sac_cfg_dict.get("sac_reward_scale", 0.01)),
+            grad_clip_norm=float(sac_cfg_dict.get("sac_grad_clip_norm", 1.0)),
+            reward_clip_min=float(sac_cfg_dict.get("sac_reward_clip_min", -500.0)),
+            reward_clip_max=float(sac_cfg_dict.get("sac_reward_clip_max", 1100.0)),
+            target_q_min=float(sac_cfg_dict.get("sac_target_q_min", -50.0)),
+            target_q_max=float(sac_cfg_dict.get("sac_target_q_max", 50.0)),
+            use_huber_loss=bool(sac_cfg_dict.get("sac_use_huber_loss", True)),
+            critic_warmup_steps=int(sac_cfg_dict.get("sac_critic_warmup_steps", 2000)),
+            use_tecrl=bool(use_tecrl or sac_cfg_dict.get("sac_use_tecrl", False)),
+            lr_entropy_critic=float(sac_cfg_dict.get("sac_lr_entropy_critic", lr_entropy_critic)),
+            entropy_budget_ratio=float(sac_cfg_dict.get("sac_entropy_budget_ratio", entropy_budget_ratio)),
+            alpha_min=float(sac_cfg_dict.get("sac_alpha_min", alpha_min)),
+        )
+        agent = SACAgent(sac_config, device=str(device), seed=seed)
+        log(f"[train-sac] SACAgent created: device={device}, config={sac_config}")
+
+    _model_name = "cnn-td3" if agent_override is not None else "cnn-sac"
 
     # --- Syllabus PLR curriculum ---
     plr_curriculum = None
@@ -2470,7 +2501,7 @@ def train_one_sac(
                 if done or truncated:
                     break
         log(f"[train-sac] Collected {len(demos)} expert transitions from {n_demo_eps} episodes")
-        if demos:
+        if demos and hasattr(agent, "pretrain_bc"):
             agent.pretrain_bc(demos, steps=bc_pretrain_steps)
             log(f"[train-sac] BC pretraining done: {bc_pretrain_steps} steps")
 
@@ -2558,10 +2589,11 @@ def train_one_sac(
 
             if global_step >= learning_starts:
                 # Critic warmup: critic-only updates before first actor update
-                if not critic_warmed_up and sac_config.critic_warmup_steps > 0:
-                    log(f"[train-sac] Critic warmup: {sac_config.critic_warmup_steps} steps...")
-                    agent.warmup_critic(sac_config.critic_warmup_steps)
-                    log("[train-sac] Critic warmup done")
+                _warmup_steps = getattr(agent.cfg, "critic_warmup_steps", 0) if sac_config is None else sac_config.critic_warmup_steps
+                if not critic_warmed_up and _warmup_steps > 0:
+                    log(f"[train] Critic warmup: {_warmup_steps} steps...")
+                    agent.warmup_critic(_warmup_steps)
+                    log("[train] Critic warmup done")
                     critic_warmed_up = True
                 update_info = agent.update()
             else:
@@ -2634,17 +2666,17 @@ def train_one_sac(
             best_state = True
             model_dir = out_dir / "models" / str(env.map_spec.name)
             model_dir.mkdir(parents=True, exist_ok=True)
-            agent.save(model_dir / "cnn-sac.pt")
+            agent.save(model_dir / f"{_model_name}.pt")
 
         if hasattr(pbar, "set_postfix"):
             pbar.set_postfix(ret=f"{ep_return:.1f}", best=f"{best_return:.1f}",
-                             steps=global_step, alpha=f"{agent.alpha:.3f}",
+                             steps=global_step, alpha=f"{getattr(agent, 'alpha', 0.0):.3f}",
                              q1=f"{update_info.get('q1_mean', 0):.2f}")
 
         if (ep + 1) % max(1, episodes // 20) == 0 or ep == 0 or ep == episodes - 1:
             elapsed = time.perf_counter() - t_start
             log(f"[train-sac] ep={ep+1}/{episodes}, ret={ep_return:.1f}, "
-                f"best={best_return:.1f}, alpha={agent.alpha:.3f}, "
+                f"best={best_return:.1f}, alpha={getattr(agent, 'alpha', 0.0):.3f}, "
                 f"q1={update_info.get('q1_mean', 0):.2f}, "
                 f"tq={update_info.get('target_q_mean', 0):.2f}, "
                 f"cbf={cbf_interventions}, "
@@ -2653,10 +2685,10 @@ def train_one_sac(
     # Final save (only if no best was saved, or save as separate file)
     model_dir = out_dir / "models" / str(env.map_spec.name)
     model_dir.mkdir(parents=True, exist_ok=True)
-    agent.save(model_dir / "cnn-sac-final.pt")
+    agent.save(model_dir / f"{_model_name}-final.pt")
     if best_state is None:
         # No best was saved during training, use final
-        agent.save(model_dir / "cnn-sac.pt")
+        agent.save(model_dir / f"{_model_name}.pt")
     log(f"[train-sac] Done: {episodes} episodes, best_return={best_return:.1f}")
 
     # Write enhanced training CSV
@@ -2672,7 +2704,210 @@ def train_one_sac(
             writer.writerow(row)
     log(f"[train-sac] Saved training CSV: {csv_path}")
 
-    return agent, returns, [], {"meta": {"algo": "cnn-sac", "episodes": episodes}}
+    return agent, returns, [], {"meta": {"algo": _model_name, "episodes": episodes}}
+
+
+# ---------------------------------------------------------------------------
+# TD3 local-obs training loop (V16-C obs: flat 154-dim, continuous actions)
+# ---------------------------------------------------------------------------
+
+def train_one_td3_local(
+    env: AMRBicycleEnv,
+    *,
+    episodes: int,
+    seed: int,
+    out_dir: Path,
+    bc_pretrain_steps: int = 5000,
+    critic_warmup_steps: int = 2000,
+    learning_starts: int = 500,
+    forest_random_start_goal: bool = True,
+    forest_rand_min_dist_m: float = 6.0,
+    forest_rand_max_dist_m: float | None = None,
+    forest_rand_fixed_prob: float = 0.1,
+    forest_rand_tries: int = 200,
+    forest_rand_edge_margin_m: float = 3.0,
+    forest_train_two_suites: bool = True,
+    forest_train_short_prob: float = 0.35,
+    forest_train_short_min_dist_m: float = 6.0,
+    forest_train_short_max_dist_m: float | None = 14.0,
+    forest_train_long_min_dist_m: float = 14.0,
+    forest_train_long_max_dist_m: float | None = None,
+    k_p: float = 12.0,
+    k_len: float = 0.10,
+    progress: bool = True,
+    device: torch.device = torch.device("cpu"),
+    flow_log_fp: "TextIO | None" = None,
+) -> tuple[object, np.ndarray, list, dict]:
+    """TD3 training loop using V16-C local obs (flat 154-dim) + BC demo."""
+    from forest_vehicle_dqn.td3_agent import TD3Agent, TD3Config
+
+    progress_write = make_progress_writer(progress, flow_log_fp=flow_log_fp)
+
+    def log(msg: str) -> None:
+        if progress_write is not None:
+            progress_write(str(msg))
+
+    # Build agent with LocalCNNEncoder (map_size=12, map_ch=1, scalar_dim=10)
+    obs_map_size = int(getattr(env, '_obs_map_size', 12))
+    td3_cfg = TD3Config(
+        map_size=obs_map_size, map_channels=1, scalar_dim=10, action_dim=2,
+        use_local_encoder=True, critic_warmup_steps=critic_warmup_steps,
+    )
+    agent = TD3Agent(td3_cfg, device=str(device), seed=seed)
+    log(f"[td3-local] Agent created: local enc, map={obs_map_size}x{obs_map_size}, "
+        f"feat_dim={agent.actor.encoder.feature_dim}")
+
+    # --- BC pretraining from expert demos ---
+    if bc_pretrain_steps > 0:
+        log("[td3-local] Collecting expert demos for BC pretraining...")
+        from forest_vehicle_dqn.baselines.mpc_local_planner import MPCConfig
+        mpc_cfg = MPCConfig()
+        demo_rng = np.random.default_rng(seed + 9999)
+        n_demo_eps = min(50, max(20, bc_pretrain_steps // 100))
+        demos: list[dict] = []
+        for demo_ep in range(n_demo_eps):
+            reset_opts = {
+                "random_start_goal": True,
+                "rand_min_dist_m": float(forest_rand_min_dist_m),
+                "rand_max_dist_m": 0.0 if forest_rand_max_dist_m is None
+                                   else float(forest_rand_max_dist_m),
+                "rand_fixed_prob": float(forest_rand_fixed_prob),
+                "rand_tries": int(forest_rand_tries),
+                "rand_edge_margin_m": float(forest_rand_edge_margin_m),
+            }
+            try:
+                env.reset(seed=int(demo_rng.integers(0, 2**31)),
+                          options=reset_opts)
+            except Exception:
+                continue
+            for _ in range(env.max_steps):
+                flat_obs = env._observe()
+                sd = td3_cfg.scalar_dim
+                ms = td3_cfg.map_size
+                obs_dict = {"maps": flat_obs[sd:].reshape(1, ms, ms),
+                            "scalars": flat_obs[:sd]}
+                try:
+                    action = env.expert_continuous_action_hybrid_astar_mpc(
+                        mpc_cfg=mpc_cfg)
+                except Exception:
+                    break
+                demos.append({"maps": obs_dict["maps"],
+                               "scalars": obs_dict["scalars"],
+                               "action": action})
+                delta_dot = float(action[0]) * float(
+                    env.model.delta_dot_max_rad_s)
+                accel = float(action[1]) * float(env.model.a_max_m_s2)
+                _, _, done, truncated, _ = env.step_continuous(
+                    delta_dot_rad_s=delta_dot, a_m_s2=accel)
+                if done or truncated:
+                    break
+        log(f"[td3-local] Collected {len(demos)} demo transitions from "
+            f"{n_demo_eps} episodes")
+        agent.pretrain_bc(demos, steps=bc_pretrain_steps)
+        log(f"[td3-local] BC pretraining done: {bc_pretrain_steps} steps")
+
+    # --- Training loop ---
+    returns = np.zeros((episodes,), dtype=np.float32)
+    global_step = 0
+    best_return = float("-inf")
+    best_state: bool | None = None
+    critic_warmed_up = False
+    update_info: dict = {}
+    t_start = float(import_time := __import__("time").perf_counter())
+    t_start = __import__("time").perf_counter()
+    rng = np.random.default_rng(seed)
+
+    try:
+        from tqdm.auto import tqdm
+        pbar = tqdm(total=episodes, desc="TD3-Local", dynamic_ncols=True)
+    except ImportError:
+        pbar = None
+
+    def reset_env() -> np.ndarray:
+        use_short = (forest_train_two_suites
+                     and rng.random() < forest_train_short_prob)
+        lo = forest_train_short_min_dist_m if use_short else \
+            forest_train_long_min_dist_m
+        hi_raw = forest_train_short_max_dist_m if use_short else \
+            forest_train_long_max_dist_m
+        hi = None if (hi_raw is None or hi_raw <= 0) else float(hi_raw)
+        opts: dict = {
+            "random_start_goal": forest_random_start_goal,
+            "rand_min_dist_m": float(lo),
+            "rand_max_dist_m": 0.0 if hi is None else float(hi),
+            "rand_fixed_prob": float(forest_rand_fixed_prob),
+            "rand_tries": int(forest_rand_tries),
+            "rand_edge_margin_m": float(forest_rand_edge_margin_m),
+        }
+        env.reset(seed=int(rng.integers(0, 2**31)), options=opts)
+        return env._observe()
+
+    for ep in range(episodes):
+        obs = reset_env()
+        ep_return = 0.0
+        done = truncated = False
+        while not (done or truncated):
+            global_step += 1
+            action = agent.act_flat(obs, explore=True)
+            delta_dot = float(action[0]) * float(env.model.delta_dot_max_rad_s)
+            accel = float(action[1]) * float(env.model.a_max_m_s2)
+            next_obs_raw, reward, done, truncated, _ = env.step_continuous(
+                delta_dot_rad_s=delta_dot, a_m_s2=accel)
+            next_obs = env._observe()
+            agent.observe_flat(obs, action, reward, next_obs, bool(done))
+
+            if global_step >= learning_starts:
+                if not critic_warmed_up and critic_warmup_steps > 0:
+                    log(f"[td3-local] Critic warmup: {critic_warmup_steps} steps...")
+                    agent.warmup_critic(critic_warmup_steps)
+                    log("[td3-local] Critic warmup done")
+                    critic_warmed_up = True
+                update_info = agent.update()
+            obs = next_obs
+            ep_return += float(reward)
+
+        returns[ep] = ep_return
+        if ep_return > best_return:
+            best_return = ep_return
+            best_state = True
+            model_dir = out_dir / "models" / str(env.map_spec.name)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            agent.save(model_dir / "cnn-td3-local.pt")
+
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix(ret=f"{ep_return:.1f}", best=f"{best_return:.1f}",
+                             q1=f"{update_info.get('q1_mean', 0):.2f}")
+
+        if (ep + 1) % max(1, episodes // 20) == 0 or ep == 0 or \
+                ep == episodes - 1:
+            elapsed = __import__("time").perf_counter() - t_start
+            log(f"[td3-local] ep={ep+1}/{episodes}, ret={ep_return:.1f}, "
+                f"best={best_return:.1f}, "
+                f"q1={update_info.get('q1_mean', 0):.2f}, "
+                f"elapsed={elapsed:.0f}s")
+
+    if pbar is not None:
+        pbar.close()
+
+    model_dir = out_dir / "models" / str(env.map_spec.name)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    agent.save(model_dir / "cnn-td3-local-final.pt")
+    if best_state is None:
+        agent.save(model_dir / "cnn-td3-local.pt")
+    log(f"[td3-local] Done: {episodes} episodes, best_return={best_return:.1f}")
+
+    import csv as _csv
+    csv_path = out_dir / "training_stats.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = _csv.writer(f)
+        w.writerow(["episode", "return"])
+        for i, r in enumerate(returns):
+            w.writerow([i + 1, float(r)])
+    log(f"[td3-local] Saved training CSV: {csv_path}")
+
+    return agent, returns, [], {"meta": {"algo": "cnn-td3-local",
+                                         "episodes": episodes}}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3051,6 +3286,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Downsampled global-map observation size (applies to both grid and forest envs).",
     )
     ap.add_argument(
+        "--obs-geodesic-goal-dist",
+        action="store_true",
+        default=False,
+        help="Add a geodesic (Dijkstra) goal-distance channel to the map observation.",
+    )
+    ap.add_argument(
+        "--reward-geodesic-progress",
+        action="store_true",
+        default=False,
+        help="Use geodesic (Dijkstra) distance for k_p progress reward instead of Euclidean.",
+    )
+    ap.add_argument(
         "--goal-tolerance-m",
         type=float,
         default=1.0,
@@ -3242,6 +3489,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Forest-only: admissible-action horizon steps used consistently in train-time gating and pretrain validation.",
     )
     ap.add_argument(
+        "--forest-adm-persistence",
+        type=int,
+        default=0,
+        help=(
+            "Forest-only: action persistence steps for admissible mask rollout. "
+            "Action held constant for this many steps, then linearly decayed to (0,0). "
+            "0 = full-horizon constant (backward compatible). Recommended: 5."
+        ),
+    )
+    ap.add_argument(
         "--forest-min-od-m",
         type=float,
         default=0.0,
@@ -3328,6 +3585,7 @@ def build_parser() -> argparse.ArgumentParser:
                      help="CBF log-barrier reward coeff (0=use legacy k_o).")
     ap.add_argument("--forest-cbf-h-max", type=float, default=2.0)
     ap.add_argument("--forest-reward-k-o", type=float, default=1.5)
+    ap.add_argument("--forest-reward-k-v", type=float, default=2.0)
     ap.add_argument("--global-map-size", type=int, default=48)
     ap.add_argument("--global-map-channels", type=int, default=3)
     # v8p3: TECRL + exponential potential + Syllabus PLR
@@ -3702,17 +3960,17 @@ def main(argv: list[str] | None = None) -> int:
     if bool(getattr(args, "forest_no_fallback", False)):
         args.forest_action_shield = False
         args.forest_expert_exploration = False
-    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-sac")
+    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "cnn-sac", "cnn-td3", "cnn-td3-local")
     raw_algos = [str(a).lower().strip() for a in (args.rl_algos or [])]
     if any(a == "all" for a in raw_algos):
-        raw_algos = list(canonical_all[:-1])  # exclude cnn-sac from "all"
+        raw_algos = list(canonical_all[:-3])  # exclude cnn-sac, cnn-td3, cnn-td3-local from "all"
 
     rl_algos: list[str] = []
     unknown = []
     for a in raw_algos:
-        if a == "cnn-sac":
-            if "cnn-sac" not in rl_algos:
-                rl_algos.append("cnn-sac")
+        if a in ("cnn-sac", "cnn-td3", "cnn-td3-local"):
+            if a not in rl_algos:
+                rl_algos.append(a)
             continue
         try:
             canonical, _arch, _base, _legacy = parse_rl_algo(a)
@@ -3836,6 +4094,7 @@ def main(argv: list[str] | None = None) -> int:
     dqn_cfg = replace(agent_cfg, n_step=n_step)
     ddqn_cfg = replace(agent_cfg, n_step=n_step)
     pddqn_cfg = replace(agent_cfg, n_step=n_step, target_update_tau=0.01)
+    mdqn_cfg = replace(agent_cfg, n_step=n_step)
     (out_dir / "configs").mkdir(parents=True, exist_ok=True)
     args_payload: dict[str, object] = {}
     for k, v in vars(args).items():
@@ -3864,9 +4123,11 @@ def main(argv: list[str] | None = None) -> int:
         "mlp-dqn": dqn_cfg,
         "mlp-ddqn": ddqn_cfg,
         "mlp-pddqn": pddqn_cfg,
+        "mlp-mdqn": mdqn_cfg,
         "cnn-dqn": dqn_cfg,
         "cnn-ddqn": ddqn_cfg,
         "cnn-pddqn": pddqn_cfg,
+        "cnn-mdqn": mdqn_cfg,
     }
     for algo in args.rl_algos:
         cfg = algo_cfgs.get(str(algo))
@@ -3884,10 +4145,14 @@ def main(argv: list[str] | None = None) -> int:
         "mlp-dqn": "MLP-DQN",
         "mlp-ddqn": "MLP-DDQN",
         "mlp-pddqn": "MLP-PDDQN",
+        "mlp-mdqn": "MLP-MDQN",
         "cnn-dqn": "CNN-DQN",
         "cnn-ddqn": "CNN-DDQN",
         "cnn-pddqn": "CNN-PDDQN",
+        "cnn-mdqn": "CNN-MDQN",
         "cnn-sac": "CNN-SAC",
+        "cnn-td3": "CNN-TD3",
+        "cnn-td3-local": "CNN-TD3-Local",
     }
 
     for env_name in args.envs:
@@ -3902,6 +4167,8 @@ def main(argv: list[str] | None = None) -> int:
                 sensor_range_m=float(args.sensor_range),
                 n_sectors=args.n_sectors,
                 obs_map_size=int(args.obs_map_size),
+                obs_geodesic_goal_dist=bool(getattr(args, "obs_geodesic_goal_dist", False)),
+                reward_geodesic_progress=bool(getattr(args, "reward_geodesic_progress", False)),
                 goal_tolerance_m=float(args.goal_tolerance_m),
                 goal_angle_tolerance_deg=float(args.goal_angle_tolerance_deg),
                 goal_stop_speed_m_s=float(args.goal_stop_speed_m_s),
@@ -3924,11 +4191,12 @@ def main(argv: list[str] | None = None) -> int:
                 cbf_h_max=float(getattr(args, "forest_cbf_h_max", 2.0)),
                 gamma=float(getattr(args, "gamma", 0.99)),
                 reward_k_o=float(getattr(args, "forest_reward_k_o", 1.5)),
+                reward_k_v=float(getattr(args, "forest_reward_k_v", 2.0)),
                 reward_potential_base=float(getattr(args, "reward_potential_base", 0.0)),
                 reward_potential_bias=float(getattr(args, "reward_potential_bias", 0.0)),
             )
             forest_demo_data = None
-            has_dqn_algos = any(str(a) != "cnn-sac" for a in args.rl_algos)
+            has_dqn_algos = any(str(a) not in ("cnn-sac", "cnn-td3", "cnn-td3-local") for a in args.rl_algos)
             if has_dqn_algos and bool(args.forest_demo_prefill) and int(args.learning_starts) > 0:
                 demo_target = forest_demo_target(
                     learning_starts=int(args.learning_starts),
@@ -3957,6 +4225,7 @@ def main(argv: list[str] | None = None) -> int:
                     forest_expert=str(args.forest_expert),
                     forest_demo_horizon=int(args.forest_demo_horizon),
                     forest_adm_horizon=int(args.forest_adm_horizon),
+                    forest_adm_persistence=int(args.forest_adm_persistence),
                     forest_min_od_m=float(args.forest_min_od_m),
                     forest_min_progress_m=float(args.forest_min_progress_m),
                     forest_use_admissible_next_mask=(not bool(getattr(args, "forest_no_fallback", False))),
@@ -3996,6 +4265,112 @@ def main(argv: list[str] | None = None) -> int:
         for algo in args.rl_algos:
             t_algo_start = time.perf_counter()
             log(f"[train] Algo start: env={env_name}, algo={str(algo)}")
+
+            # --- TD3 branch (reuses SAC training loop) ---
+            if str(algo) == "cnn-td3":
+                if not isinstance(env, AMRBicycleEnv):
+                    print(f"cnn-td3 requires AMRBicycleEnv, got {type(env).__name__}", file=sys.stderr)
+                    return 2
+                from forest_vehicle_dqn.td3_agent import TD3Agent, TD3Config
+                td3_cfg = TD3Config(
+                    map_size=int(getattr(args, "global_map_size", 48)),
+                    map_channels=3, scalar_dim=12, action_dim=2,
+                )
+                td3_agent = TD3Agent(td3_cfg, device=str(device), seed=args.seed + 2000)
+                sac_cfg_raw = {}
+                if config_path is not None:
+                    sac_cfg_raw = select_section(load_json(Path(config_path)), section="train")
+                try:
+                    _, algo_returns, algo_eval, algo_extra = train_one_sac(
+                        env,
+                        episodes=args.episodes,
+                        seed=args.seed + 2000,
+                        out_dir=out_dir,
+                        sac_cfg_dict=sac_cfg_raw,
+                        global_map_size=int(getattr(args, "global_map_size", 48)),
+                        learning_starts=int(args.learning_starts),
+                        forest_random_start_goal=bool(args.forest_random_start_goal),
+                        forest_rand_min_dist_m=float(args.forest_rand_min_dist_m),
+                        forest_rand_max_dist_m=rand_max,
+                        forest_rand_fixed_prob=float(args.forest_rand_fixed_prob),
+                        forest_rand_tries=int(args.forest_rand_tries),
+                        forest_rand_edge_margin_m=float(args.forest_rand_edge_margin_m),
+                        forest_curriculum=bool(args.forest_curriculum),
+                        forest_train_two_suites=bool(getattr(args, "forest_train_two_suites", False)),
+                        forest_train_short_prob=float(getattr(args, "forest_train_short_prob", 0.35)),
+                        forest_train_short_min_dist_m=float(getattr(args, "forest_train_short_min_dist_m", 6.0)),
+                        forest_train_short_max_dist_m=(
+                            None if float(getattr(args, "forest_train_short_max_dist_m", 14.0)) <= 0.0
+                            else float(getattr(args, "forest_train_short_max_dist_m", 14.0))
+                        ),
+                        forest_train_long_min_dist_m=float(getattr(args, "forest_train_long_min_dist_m", 42.0)),
+                        forest_train_long_max_dist_m=(
+                            None if float(getattr(args, "forest_train_long_max_dist_m", 0.0)) <= 0.0
+                            else float(getattr(args, "forest_train_long_max_dist_m", 0.0))
+                        ),
+                        progress=progress,
+                        device=device,
+                        flow_log_fp=flow_log_fp,
+                        agent_override=td3_agent,
+                    )
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    return 2
+                env_curves[str(algo)] = algo_returns
+                env_eval_rows[str(algo)] = list(algo_eval)
+                env_train_meta[str(algo)] = algo_extra.get("meta", {})
+                log(f"[train] Algo done: env={env_name}, algo={str(algo)}, "
+                    f"elapsed={format_elapsed_s(time.perf_counter() - t_algo_start)}")
+                continue
+
+            # --- TD3-local branch (V16-C obs + continuous actions) ---
+            if str(algo) == "cnn-td3-local":
+                if not isinstance(env, AMRBicycleEnv):
+                    print(f"cnn-td3-local requires AMRBicycleEnv, got {type(env).__name__}", file=sys.stderr)
+                    return 2
+                try:
+                    _, algo_returns, algo_eval, algo_extra = train_one_td3_local(
+                        env,
+                        episodes=args.episodes,
+                        seed=args.seed + 3000,
+                        out_dir=out_dir,
+                        bc_pretrain_steps=int(getattr(args, "sac_bc_pretrain_steps", 5000)),
+                        learning_starts=int(args.learning_starts),
+                        forest_random_start_goal=bool(args.forest_random_start_goal),
+                        forest_rand_min_dist_m=float(args.forest_rand_min_dist_m),
+                        forest_rand_max_dist_m=rand_max,
+                        forest_rand_fixed_prob=float(args.forest_rand_fixed_prob),
+                        forest_rand_tries=int(args.forest_rand_tries),
+                        forest_rand_edge_margin_m=float(args.forest_rand_edge_margin_m),
+                        forest_train_two_suites=bool(getattr(args, "forest_train_two_suites", False)),
+                        forest_train_short_prob=float(getattr(args, "forest_train_short_prob", 0.35)),
+                        forest_train_short_min_dist_m=float(getattr(args, "forest_train_short_min_dist_m", 6.0)),
+                        forest_train_short_max_dist_m=(
+                            None if float(getattr(args, "forest_train_short_max_dist_m", 14.0)) <= 0.0
+                            else float(getattr(args, "forest_train_short_max_dist_m", 14.0))
+                        ),
+                        forest_train_long_min_dist_m=float(getattr(args, "forest_train_long_min_dist_m", 42.0)),
+                        forest_train_long_max_dist_m=(
+                            None if float(getattr(args, "forest_train_long_max_dist_m", 0.0)) <= 0.0
+                            else float(getattr(args, "forest_train_long_max_dist_m", 0.0))
+                        ),
+                        k_p=float(getattr(args, "forest_reward_k_p", 12.0)),
+                        k_len=float(getattr(args, "forest_reward_k_len", 0.10)),
+                        progress=progress,
+                        device=device,
+                        flow_log_fp=flow_log_fp,
+                    )
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    return 2
+                env_curves[str(algo)] = algo_returns
+                env_eval_rows[str(algo)] = list(algo_eval)
+                env_train_meta[str(algo)] = algo_extra.get("meta", {})
+                log(f"[train] Algo done: env={env_name}, algo={str(algo)}, "
+                    f"elapsed={format_elapsed_s(time.perf_counter() - t_algo_start)}")
+                continue
 
             # --- SAC branch ---
             if str(algo) == "cnn-sac":
@@ -4113,6 +4488,7 @@ def main(argv: list[str] | None = None) -> int:
                     forest_expert_exploration=bool(args.forest_expert_exploration),
                     forest_action_shield=bool(args.forest_action_shield),
                     forest_adm_horizon=int(args.forest_adm_horizon),
+                    forest_adm_persistence=int(args.forest_adm_persistence),
                     forest_topk=int(args.forest_topk),
                     forest_min_od_m=float(args.forest_min_od_m),
                     forest_min_progress_m=float(args.forest_min_progress_m),
