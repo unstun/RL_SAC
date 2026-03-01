@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -80,10 +80,15 @@ class AgentConfig:
     # Training-only admissibility auxiliary supervision (BCE on per-action admissibility mask).
     # Inference remains pure argmax(Q) and never consults this head.
     aux_admissibility_lambda: float = 0.0
+    # Munchausen DQN (Vieillard et al., NeurIPS 2020): soft backup + log-policy
+    # reward augmentation.  Only active when base_algo == "mdqn".
+    mdqn_tau: float = 0.03    # softmax temperature
+    mdqn_alpha: float = 0.9   # log-policy scaling
+    mdqn_l0: float = -1.0     # log-policy clipping lower bound
 
 
-AlgoArch = Literal["mlp", "cnn"]
-AlgoBase = Literal["dqn", "ddqn"]
+AlgoArch = Literal["mlp", "cnn", "cnn-dual", "cnn-drqn", "cnn-hist"]
+AlgoBase = Literal["dqn", "ddqn", "mdqn"]
 
 
 def parse_rl_algo(algo: str) -> tuple[str, AlgoArch, AlgoBase, bool]:
@@ -103,15 +108,31 @@ def parse_rl_algo(algo: str) -> tuple[str, AlgoArch, AlgoBase, bool]:
         # Legacy name (avoid collision with published "IDDQN").
         return ("cnn-pddqn", "cnn", "ddqn", True)
 
-    supported = {"mlp-dqn", "mlp-ddqn", "mlp-pddqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn"}
+    supported = {
+        "mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn",
+        "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn",
+    }
     if a in supported:
         arch_s, variant = a.split("-", 1)
         arch: AlgoArch = "mlp" if arch_s == "mlp" else "cnn"
-        base: AlgoBase = "dqn" if variant == "dqn" else "ddqn"
+        if variant == "dqn":
+            base: AlgoBase = "dqn"
+        elif variant == "mdqn":
+            base = "mdqn"
+        else:
+            base = "ddqn"
         return (a, arch, base, False)
 
+    if a == "cnn-dual-ddqn":
+        return ("cnn-dual-ddqn", "cnn-dual", "ddqn", False)
+    if a == "cnn-drqn":
+        return ("cnn-drqn", "cnn-drqn", "dqn", False)
+    if a == "cnn-histformer":
+        return ("cnn-histformer", "cnn-hist", "dqn", False)
+
     raise ValueError(
-        "algo must be one of: mlp-dqn mlp-ddqn mlp-pddqn cnn-dqn cnn-ddqn cnn-pddqn "
+        "algo must be one of: mlp-dqn mlp-ddqn mlp-pddqn mlp-mdqn "
+        "cnn-dqn cnn-ddqn cnn-pddqn cnn-mdqn "
         "(legacy: dqn ddqn iddqn cnn-iddqn)"
     )
 
@@ -155,6 +176,10 @@ class DQNFamilyAgent:
                 "mha_heads": int(getattr(config, "mha_heads", 4)),
                 "n_quantiles": int(getattr(config, "n_quantiles", 1)),
             }
+        elif self.arch == "cnn-dual":
+            from forest_vehicle_dqn.networks import DualScaleCNNQNetwork
+            self._net_cls = DualScaleCNNQNetwork
+            self._net_kwargs = {}
         else:
             self._net_cls = MLPQNetwork
             self._net_kwargs = {}
@@ -634,12 +659,30 @@ class DQNFamilyAgent:
                         q_next_target = self._q_values(self.q_target(next_obs_n))
                         q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
                         next_q = q_next_target.gather(1, next_actions).squeeze(1)
+                        next_q = torch.where(torch.isfinite(next_q), next_q, torch.zeros_like(next_q))
+                        target = rewards_n + (1.0 - dones_n) * (gamma_n * next_q)
+                    elif self.base_algo == "mdqn":
+                        _tau = float(self.config.mdqn_tau)
+                        _alpha = float(self.config.mdqn_alpha)
+                        _l0 = float(self.config.mdqn_l0)
+                        q_tgt_next = self._q_values(self.q_target(next_obs_n))
+                        q_tgt_next = q_tgt_next.masked_fill(~mask, torch.finfo(q_tgt_next.dtype).min)
+                        pi_next = F.softmax(q_tgt_next / _tau, dim=1)
+                        log_pi_next = torch.log(pi_next + 1e-8).clamp(min=_l0)
+                        soft_v = (pi_next * (q_tgt_next - _tau * log_pi_next)).sum(dim=1)
+                        soft_v = torch.where(torch.isfinite(soft_v), soft_v, torch.zeros_like(soft_v))
+                        q_tgt_curr = self._q_values(self.q_target(obs))
+                        pi_curr = F.softmax(q_tgt_curr / _tau, dim=1)
+                        log_pi_curr = torch.log(pi_curr + 1e-8).clamp(min=_l0)
+                        log_pi_a = log_pi_curr.gather(1, actions.view(-1, 1)).squeeze(1)
+                        target = (rewards_n + _alpha * _tau * log_pi_a
+                                  + (1.0 - dones_n) * (gamma_n * soft_v))
                     else:
                         q_next_target = self._q_values(self.q_target(next_obs_n))
                         q_next_target = q_next_target.masked_fill(~mask, torch.finfo(q_next_target.dtype).min)
                         next_q = q_next_target.max(dim=1).values
-                    next_q = torch.where(torch.isfinite(next_q), next_q, torch.zeros_like(next_q))
-                    target = rewards_n + (1.0 - dones_n) * (gamma_n * next_q)
+                        next_q = torch.where(torch.isfinite(next_q), next_q, torch.zeros_like(next_q))
+                        target = rewards_n + (1.0 - dones_n) * (gamma_n * next_q)
 
             if nq > 1:
                 td_loss = self._quantile_td_loss(q_quantiles, target_q)
@@ -728,6 +771,14 @@ class DQNFamilyAgent:
                         qnt = self._q_values(self.q_target(next_obs))
                         qnt = qnt.masked_fill(~msk, torch.finfo(qnt.dtype).min)
                         nv = qnt.gather(1, na).squeeze(1)
+                    elif self.base_algo == "mdqn":
+                        _tau = float(self.config.mdqn_tau)
+                        _l0 = float(self.config.mdqn_l0)
+                        qnt = self._q_values(self.q_target(next_obs))
+                        qnt = qnt.masked_fill(~msk, torch.finfo(qnt.dtype).min)
+                        pi = F.softmax(qnt / _tau, dim=1)
+                        lp = torch.log(pi + 1e-8).clamp(min=_l0)
+                        nv = (pi * (qnt - _tau * lp)).sum(dim=1)
                     else:
                         qnt = self._q_values(self.q_target(next_obs))
                         qnt = qnt.masked_fill(~msk, torch.finfo(qnt.dtype).min)
@@ -737,6 +788,18 @@ class DQNFamilyAgent:
                 target1 = rewards_1 + (1.0 - dones_1) * (float(gamma) * next_q1)
                 next_qn = _scalar_next_q(next_obs_n, maskn)
                 targetn = rewards_n + (1.0 - dones_n) * (gamma_n * next_qn)
+                # M-DQN: add log-policy reward augmentation to targets.
+                if self.base_algo == "mdqn":
+                    _tau = float(self.config.mdqn_tau)
+                    _alpha = float(self.config.mdqn_alpha)
+                    _l0 = float(self.config.mdqn_l0)
+                    q_tgt_c = self._q_values(self.q_target(obs))
+                    pi_c = F.softmax(q_tgt_c / _tau, dim=1)
+                    lp_c = torch.log(pi_c + 1e-8).clamp(min=_l0)
+                    lp_a = lp_c.gather(1, actions.view(-1, 1)).squeeze(1)
+                    bonus = _alpha * _tau * lp_a
+                    target1 = target1 + bonus
+                    targetn = targetn + bonus
 
         # TD losses (importance-sampled).
         is_w = weights.to(torch.float32).clamp_min(0.0)
@@ -869,6 +932,11 @@ class DQNFamilyAgent:
             else:
                 net_kwargs = {str(k): v for k, v in net_kwargs_raw.items()}
             self.arch = "cnn"
+        elif network == "cnn-dual":
+            from forest_vehicle_dqn.networks import DualScaleCNNQNetwork
+            net_cls = DualScaleCNNQNetwork
+            net_kwargs = {}
+            self.arch = "cnn-dual"
         else:
             raise ValueError(f"Unsupported network type in checkpoint: {network!r}")
 
@@ -878,6 +946,12 @@ class DQNFamilyAgent:
         cfg = payload.get("config") or {}
         hidden_dim = int(cfg.get("hidden_dim", self.config.hidden_dim))
         hidden_layers = int(cfg.get("hidden_layers", self.config.hidden_layers))
+
+        # Restore module flags from checkpoint so _q_values / act behave correctly.
+        restore_keys = ("n_quantiles", "noisy_net", "cbam", "mha", "mha_heads", "dueling")
+        restore = {k: cfg[k] for k in restore_keys if k in cfg}
+        if restore:
+            self.config = replace(self.config, **restore)
 
         # Architecture can change across experiments (hidden_dim/layers). Rebuild when shapes mismatch.
         try:
@@ -905,3 +979,285 @@ class DQNFamilyAgent:
 
         self._train_steps = int(payload.get("train_steps", 0))
         self.optimizer = torch.optim.Adam(self._optimizer_params(), lr=self.config.learning_rate)
+
+
+# ---------------------------------------------------------------------------
+# V36: Shared helpers for DRQN / HistFormer
+# ---------------------------------------------------------------------------
+
+class EpisodeReplayBuffer:
+    """Stores completed episodes; samples contiguous sub-sequences.
+
+    Each episode is a list of (obs, action, reward, next_obs, done) tuples.
+    """
+
+    def __init__(self, capacity: int = 1000, seq_len: int = 8) -> None:
+        self.capacity = int(capacity)
+        self.seq_len = int(seq_len)
+        self._episodes: list[list] = []
+
+    def add_episode(self, episode: list) -> None:
+        if len(episode) < 2:
+            return
+        if len(self._episodes) >= self.capacity:
+            self._episodes.pop(0)
+        self._episodes.append(list(episode))
+
+    def __len__(self) -> int:
+        return len(self._episodes)
+
+    def sample_sequences(
+        self, batch_size: int, rng: np.random.Generator
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        T = self.seq_len
+        obs_l, act_l, rew_l, nobs_l, done_l = [], [], [], [], []
+        while len(obs_l) < batch_size:
+            ep = self._episodes[int(rng.integers(0, len(self._episodes)))]
+            if len(ep) < T:
+                ep = ep + [ep[-1]] * (T - len(ep))
+                start = 0
+            else:
+                start = int(rng.integers(0, len(ep) - T + 1))
+            seq = ep[start: start + T]
+            obs_l.append(np.stack([t[0] for t in seq]))
+            act_l.append(np.array([t[1] for t in seq], dtype=np.int64))
+            rew_l.append(np.array([t[2] for t in seq], dtype=np.float32))
+            nobs_l.append(np.stack([t[3] for t in seq]))
+            done_l.append(np.array([t[4] for t in seq], dtype=np.float32))
+        return (
+            np.stack(obs_l), np.stack(act_l), np.stack(rew_l),
+            np.stack(nobs_l), np.stack(done_l),
+        )
+
+
+class DRQNAgent:
+    """V36-A: DRQN agent (CNN → LSTM → Q). Requires EpisodeReplayBuffer."""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        *,
+        config: AgentConfig,
+        device: str | torch.device = "cpu",
+        seed: int = 0,
+        seq_len: int = 8,
+    ) -> None:
+        from forest_vehicle_dqn.networks import DRQNNetwork
+        self.device = torch.device(device)
+        self.config = config
+        self._n_actions = int(n_actions)
+        self._obs_dim = int(obs_dim)
+        self.seq_len = int(seq_len)
+        self._rng = np.random.default_rng(seed)
+        torch.manual_seed(seed)
+
+        self.q = DRQNNetwork(obs_dim, n_actions, hidden_dim=config.hidden_dim).to(self.device)
+        self.q_target = DRQNNetwork(obs_dim, n_actions, hidden_dim=config.hidden_dim).to(self.device)
+        self.q_target.load_state_dict(self.q.state_dict())
+        self.q_target.eval()
+
+        self.optimizer = torch.optim.Adam(self.q.parameters(), lr=config.learning_rate)
+        self.replay = EpisodeReplayBuffer(capacity=1000, seq_len=seq_len)
+        self._hidden: tuple | None = None
+        self._cur_ep: list = []
+        self._train_steps = 0
+
+    def reset_episode(self) -> None:
+        self._hidden = self.q.init_hidden(1, self.device)
+        if self._cur_ep:
+            self.replay.add_episode(self._cur_ep)
+        self._cur_ep = []
+
+    @property
+    def eps(self) -> float:
+        return float(np.clip(
+            float(self.config.eps_start) - float(self._train_steps) *
+            (float(self.config.eps_start) - float(self.config.eps_final)) /
+            max(1, int(self.config.eps_decay)),
+            float(self.config.eps_final), float(self.config.eps_start),
+        ))
+
+    def act(self, obs: np.ndarray, explore: bool = True) -> int:
+        if explore and self._rng.random() < self.eps:
+            return int(self._rng.integers(0, self._n_actions))
+        x = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            q, self._hidden = self.q(x, self._hidden)
+        return int(q.argmax(dim=-1).item())
+
+    def observe(self, obs: np.ndarray, action: int, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        self._cur_ep.append((obs.copy(), int(action), float(reward), next_obs.copy(), bool(done)))
+
+    def train_step(self) -> float | None:
+        if len(self.replay) < 4:
+            return None
+        obs_b, act_b, rew_b, nobs_b, done_b = self.replay.sample_sequences(
+            self.config.batch_size, self._rng
+        )
+        B, T = obs_b.shape[:2]
+        dev = self.device
+        obs_t = torch.as_tensor(obs_b, dtype=torch.float32, device=dev)
+        act_t = torch.as_tensor(act_b, dtype=torch.long, device=dev)
+        rew_t = torch.as_tensor(rew_b, dtype=torch.float32, device=dev)
+        nobs_t = torch.as_tensor(nobs_b, dtype=torch.float32, device=dev)
+        done_t = torch.as_tensor(done_b, dtype=torch.float32, device=dev)
+        gamma = float(self.config.gamma)
+
+        with torch.no_grad():
+            q_next, _ = self.q_target(nobs_t)     # (B, T, n_actions)
+            q_next_online, _ = self.q(nobs_t)     # DDQN: online net for argmax
+            next_act = q_next_online.argmax(dim=-1, keepdim=True)
+            q_next_val = q_next.gather(2, next_act).squeeze(2)  # (B, T)
+            target = rew_t + gamma * q_next_val * (1.0 - done_t)
+
+        q_vals, _ = self.q(obs_t)                  # (B, T, n_actions)
+        q_taken = q_vals.gather(2, act_t.unsqueeze(2)).squeeze(2)  # (B, T)
+        loss = F.smooth_l1_loss(q_taken, target)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q.parameters(), self.config.grad_clip_norm)
+        self.optimizer.step()
+        self._train_steps += 1
+        if self._train_steps % self.config.target_update_steps == 0:
+            self.q_target.load_state_dict(self.q.state_dict())
+        return float(loss.item())
+
+    def save(self, path: str | "Path") -> None:
+        torch.save({
+            "algo": "cnn-drqn", "network": "cnn-drqn",
+            "q_state_dict": self.q.state_dict(),
+            "q_target_state_dict": self.q_target.state_dict(),
+            "train_steps": self._train_steps,
+            "config": {"hidden_dim": self.config.hidden_dim, "hidden_layers": self.config.hidden_layers},
+        }, str(path))
+
+    def load(self, path: str | "Path") -> None:
+        payload = torch.load(str(path), map_location=self.device)
+        self.q.load_state_dict(payload["q_state_dict"])
+        self.q_target.load_state_dict(payload.get("q_target_state_dict", payload["q_state_dict"]))
+        self._train_steps = int(payload.get("train_steps", 0))
+
+
+class HistFormerAgent:
+    """V36-C: HistTransformer agent (CNN → rolling T-step buffer → Transformer → Q)."""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        *,
+        config: AgentConfig,
+        device: str | torch.device = "cpu",
+        seed: int = 0,
+        seq_len: int = 8,
+        d_model: int = 128,
+    ) -> None:
+        from forest_vehicle_dqn.networks import HistTransformerNetwork
+        self.device = torch.device(device)
+        self.config = config
+        self._n_actions = int(n_actions)
+        self._obs_dim = int(obs_dim)
+        self.seq_len = int(seq_len)
+        self.d_model = int(d_model)
+        self._rng = np.random.default_rng(seed)
+        torch.manual_seed(seed)
+
+        self.q = HistTransformerNetwork(
+            obs_dim, n_actions, d_model=d_model, seq_len=seq_len, hidden_dim=config.hidden_dim
+        ).to(self.device)
+        self.q_target = HistTransformerNetwork(
+            obs_dim, n_actions, d_model=d_model, seq_len=seq_len, hidden_dim=config.hidden_dim
+        ).to(self.device)
+        self.q_target.load_state_dict(self.q.state_dict())
+        self.q_target.eval()
+
+        self.optimizer = torch.optim.Adam(self.q.parameters(), lr=config.learning_rate)
+        self.replay = EpisodeReplayBuffer(capacity=1000, seq_len=seq_len)
+        self._hist_buf: torch.Tensor | None = None  # (1, T, d_model)
+        self._cur_ep: list = []
+        self._train_steps = 0
+
+    def reset_episode(self) -> None:
+        self._hist_buf = torch.zeros(1, self.seq_len, self.d_model, device=self.device)
+        if self._cur_ep:
+            self.replay.add_episode(self._cur_ep)
+        self._cur_ep = []
+
+    @property
+    def eps(self) -> float:
+        return float(np.clip(
+            float(self.config.eps_start) - float(self._train_steps) *
+            (float(self.config.eps_start) - float(self.config.eps_final)) /
+            max(1, int(self.config.eps_decay)),
+            float(self.config.eps_final), float(self.config.eps_start),
+        ))
+
+    def act(self, obs: np.ndarray, explore: bool = True) -> int:
+        if explore and self._rng.random() < self.eps:
+            return int(self._rng.integers(0, self._n_actions))
+        x = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            feat = self.q.encode_step(x.unsqueeze(0))        # (1, d_model)
+        assert self._hist_buf is not None
+        self._hist_buf = torch.roll(self._hist_buf, -1, dims=1)
+        self._hist_buf[0, -1, :] = feat[0]
+        with torch.no_grad():
+            q = self.q(self._hist_buf)                        # (1, n_actions)
+        return int(q.argmax(dim=-1).item())
+
+    def observe(self, obs: np.ndarray, action: int, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        self._cur_ep.append((obs.copy(), int(action), float(reward), next_obs.copy(), bool(done)))
+
+    def train_step(self) -> float | None:
+        if len(self.replay) < 4:
+            return None
+        obs_b, act_b, rew_b, nobs_b, done_b = self.replay.sample_sequences(
+            self.config.batch_size, self._rng
+        )
+        B, T = obs_b.shape[:2]
+        dev = self.device
+        obs_t = torch.as_tensor(obs_b, dtype=torch.float32, device=dev)
+        act_t = torch.as_tensor(act_b, dtype=torch.long, device=dev)
+        rew_t = torch.as_tensor(rew_b, dtype=torch.float32, device=dev)
+        nobs_t = torch.as_tensor(nobs_b, dtype=torch.float32, device=dev)
+        done_t = torch.as_tensor(done_b, dtype=torch.float32, device=dev)
+        gamma = float(self.config.gamma)
+        obs_flat = obs_t.reshape(B * T, -1)
+        nobs_flat = nobs_t.reshape(B * T, -1)
+        with torch.no_grad():
+            nfeat = self.q_target.encode_step(nobs_flat).reshape(B, T, self.d_model)
+            nfeat_online = self.q.encode_step(nobs_flat).reshape(B, T, self.d_model)
+            q_next = self.q_target(nfeat)
+            q_next_online = self.q(nfeat_online)
+            next_act = q_next_online.argmax(dim=-1, keepdim=True)
+            q_next_val = q_next.gather(1, next_act).squeeze(1)
+            target = rew_t[:, -1] + gamma * q_next_val * (1.0 - done_t[:, -1])
+        feat = self.q.encode_step(obs_flat).reshape(B, T, self.d_model)
+        q_vals = self.q(feat)
+        q_taken = q_vals.gather(1, act_t[:, -1].unsqueeze(1)).squeeze(1)
+        loss = F.smooth_l1_loss(q_taken, target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q.parameters(), self.config.grad_clip_norm)
+        self.optimizer.step()
+        self._train_steps += 1
+        if self._train_steps % self.config.target_update_steps == 0:
+            self.q_target.load_state_dict(self.q.state_dict())
+        return float(loss.item())
+
+    def save(self, path: str | "Path") -> None:
+        torch.save({
+            "algo": "cnn-histformer", "network": "cnn-hist",
+            "q_state_dict": self.q.state_dict(),
+            "q_target_state_dict": self.q_target.state_dict(),
+            "train_steps": self._train_steps,
+            "config": {"hidden_dim": self.config.hidden_dim, "hidden_layers": self.config.hidden_layers},
+        }, str(path))
+
+    def load(self, path: str | "Path") -> None:
+        payload = torch.load(str(path), map_location=self.device)
+        self.q.load_state_dict(payload["q_state_dict"])
+        self.q_target.load_state_dict(payload.get("q_target_state_dict", payload["q_state_dict"]))
+        self._train_steps = int(payload.get("train_steps", 0))

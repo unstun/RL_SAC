@@ -712,6 +712,188 @@ def rollout_td3_local(
     )
 
 
+# ---------------------------------------------------------------------------
+# V36-A: rollout_drqn — DRQN inference (maintains LSTM hidden state)
+# ---------------------------------------------------------------------------
+
+def rollout_drqn(
+    env: "AMRBicycleEnv",
+    agent,  # DRQNAgent
+    *,
+    max_steps: int,
+    seed: int,
+    reset_options: dict | None = None,
+    time_mode: str = "rollout",
+    forest_adm_horizon: int = 30,
+    forest_topk: int = 10,
+    forest_min_od_m: float = 0.02,
+    forest_min_progress_m: float = 0.01,
+) -> "RolloutResult":
+    import time as _time
+    agent.reset_episode()
+    obs, _info = env.reset(seed=seed, options=reset_options)
+    path: list = [(float(env.start_xy[0]), float(env.start_xy[1]))]
+    dt_s = float(_env_dt_s(env))
+    reached = False
+    last_collision = False
+    truncated = False
+    steps = 0
+    path_time_s = 0.0
+    inference_time_s = 0.0
+    failure_reason = "timeout"
+    adm_h = max(1, int(forest_adm_horizon))
+    topk_k = max(1, int(forest_topk))
+    min_od = float(forest_min_od_m)
+    min_prog = float(forest_min_progress_m)
+
+    for step in range(int(max_steps)):
+        t0 = _time.perf_counter()
+        # Inline Q-values to enable admissibility masking (preserves hidden state update)
+        _x = torch.as_tensor(obs, dtype=torch.float32, device=agent.device).unsqueeze(0)
+        with torch.no_grad():
+            _q, agent._hidden = agent.q(_x, agent._hidden)  # (1, n_actions)
+        _q = _q.squeeze(0)  # (n_actions,)
+        _a0 = int(_q.argmax().item())
+        _action = _a0
+        # Layer 1: check admissibility of argmax action
+        _a0_adm = bool(env.is_action_admissible(
+            _a0, horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog, action_persistence=1))
+        if not _a0_adm:
+            # Layer 2: top-k admissible replacement
+            _chosen = None
+            for _cand in torch.topk(_q, k=min(topk_k, int(_q.numel()))).indices.tolist():
+                if _cand != _a0 and bool(env.is_action_admissible(
+                        _cand, horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog, action_persistence=1)):
+                    _chosen = int(_cand)
+                    break
+            if _chosen is None:
+                # Layer 3: masked argmax over admissible actions
+                _mask = env.admissible_action_mask(
+                    horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog,
+                    fallback_to_safe=False, action_persistence=1)
+                if bool(_mask.any()):
+                    _qm = _q.clone()
+                    _qm[torch.from_numpy(~_mask).to(_q.device)] = torch.finfo(_qm.dtype).min
+                    _chosen = int(_qm.argmax().item())
+            if _chosen is not None:
+                _action = _chosen
+        inference_time_s += _time.perf_counter() - t0
+        next_obs, _reward, done, trunc, info = env.step(_action)
+        steps += 1
+        path_time_s += dt_s
+        path.append((float(env._x_m / env.cell_size_m), float(env._y_m / env.cell_size_m)))
+        last_collision = bool(getattr(env, "_last_collision", False))
+        if done:
+            reached = bool(info.get("reached", False))
+            failure_reason = "success" if reached else "collision"
+            break
+        if trunc:
+            truncated = True
+            break
+        obs = next_obs
+
+    if time_mode == "rollout":
+        compute_time_s = inference_time_s
+    else:
+        compute_time_s = inference_time_s
+
+    return RolloutResult(
+        path_xy_cells=path, compute_time_s=compute_time_s, reached=reached,
+        steps=steps, path_time_s=path_time_s, controls=None,
+        collision=last_collision, truncated=truncated, debug={"failure_reason": failure_reason},
+    )
+
+
+# ---------------------------------------------------------------------------
+# V36-C: rollout_histformer — HistFormer inference (rolling feature buffer)
+# ---------------------------------------------------------------------------
+
+def rollout_histformer(
+    env: "AMRBicycleEnv",
+    agent,  # HistFormerAgent
+    *,
+    max_steps: int,
+    seed: int,
+    reset_options: dict | None = None,
+    time_mode: str = "rollout",
+    forest_adm_horizon: int = 30,
+    forest_topk: int = 10,
+    forest_min_od_m: float = 0.02,
+    forest_min_progress_m: float = 0.01,
+) -> "RolloutResult":
+    import time as _time
+    agent.reset_episode()
+    obs, _info = env.reset(seed=seed, options=reset_options)
+    path: list = [(float(env.start_xy[0]), float(env.start_xy[1]))]
+    dt_s = float(_env_dt_s(env))
+    reached = False
+    last_collision = False
+    truncated = False
+    steps = 0
+    path_time_s = 0.0
+    inference_time_s = 0.0
+    failure_reason = "timeout"
+    adm_h = max(1, int(forest_adm_horizon))
+    topk_k = max(1, int(forest_topk))
+    min_od = float(forest_min_od_m)
+    min_prog = float(forest_min_progress_m)
+
+    for step in range(int(max_steps)):
+        t0 = _time.perf_counter()
+        # Inline Q-values to enable admissibility masking (preserves hist_buf update)
+        _x = torch.as_tensor(obs, dtype=torch.float32, device=agent.device)
+        with torch.no_grad():
+            _feat = agent.q.encode_step(_x.unsqueeze(0))  # (1, d_model)
+        agent._hist_buf = torch.roll(agent._hist_buf, -1, dims=1)
+        agent._hist_buf[0, -1, :] = _feat[0]
+        with torch.no_grad():
+            _q = agent.q(agent._hist_buf).squeeze(0)  # (n_actions,)
+        _a0 = int(_q.argmax().item())
+        _action = _a0
+        # Layer 1: check admissibility of argmax action
+        _a0_adm = bool(env.is_action_admissible(
+            _a0, horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog, action_persistence=1))
+        if not _a0_adm:
+            # Layer 2: top-k admissible replacement
+            _chosen = None
+            for _cand in torch.topk(_q, k=min(topk_k, int(_q.numel()))).indices.tolist():
+                if _cand != _a0 and bool(env.is_action_admissible(
+                        _cand, horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog, action_persistence=1)):
+                    _chosen = int(_cand)
+                    break
+            if _chosen is None:
+                # Layer 3: masked argmax over admissible actions
+                _mask = env.admissible_action_mask(
+                    horizon_steps=adm_h, min_od_m=min_od, min_progress_m=min_prog,
+                    fallback_to_safe=False, action_persistence=1)
+                if bool(_mask.any()):
+                    _qm = _q.clone()
+                    _qm[torch.from_numpy(~_mask).to(_q.device)] = torch.finfo(_qm.dtype).min
+                    _chosen = int(_qm.argmax().item())
+            if _chosen is not None:
+                _action = _chosen
+        inference_time_s += _time.perf_counter() - t0
+        next_obs, _reward, done, trunc, info = env.step(_action)
+        steps += 1
+        path_time_s += dt_s
+        path.append((float(env._x_m / env.cell_size_m), float(env._y_m / env.cell_size_m)))
+        last_collision = bool(getattr(env, "_last_collision", False))
+        if done:
+            reached = bool(info.get("reached", False))
+            failure_reason = "success" if reached else "collision"
+            break
+        if trunc:
+            truncated = True
+            break
+        obs = next_obs
+
+    return RolloutResult(
+        path_xy_cells=path, compute_time_s=inference_time_s, reached=reached,
+        steps=steps, path_time_s=path_time_s, controls=None,
+        collision=last_collision, truncated=truncated, debug={"failure_reason": failure_reason},
+    )
+
+
 def rollout_sac(
     env: AMRBicycleEnv,
     agent,  # SACAgent
@@ -1647,7 +1829,7 @@ def main(argv: list[str] | None = None) -> int:
     forest_envs = set(FOREST_ENV_ORDER)
     if int(args.max_steps) == 300 and args.envs and all(str(e) in forest_envs for e in args.envs):
         args.max_steps = 600
-    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "cnn-sac", "cnn-td3", "cnn-td3-local")
+    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "cnn-sac", "cnn-td3", "cnn-td3-local", "cnn-dual-ddqn", "cnn-drqn", "cnn-histformer")
     raw_algos = [str(a).lower().strip() for a in (args.rl_algos or [])]
     if any(a == "all" for a in raw_algos):
         raw_algos = list(canonical_all[:-3])  # exclude cnn-sac, cnn-td3, cnn-td3-local from "all"
@@ -1655,7 +1837,7 @@ def main(argv: list[str] | None = None) -> int:
     rl_algos: list[str] = []
     unknown = []
     for a in raw_algos:
-        if a in ("cnn-sac", "cnn-td3", "cnn-td3-local"):
+        if a in ("cnn-sac", "cnn-td3", "cnn-td3-local", "cnn-dual-ddqn", "cnn-drqn", "cnn-histformer"):
             if a not in rl_algos:
                 rl_algos.append(a)
             continue
@@ -2350,6 +2532,9 @@ def main(argv: list[str] | None = None) -> int:
                 "cnn-sac": "CNN-SAC",
                 "cnn-td3": "CNN-TD3",
                 "cnn-td3-local": "CNN-TD3-Local",
+                "cnn-dual-ddqn": "CNN-Dual-DDQN",
+                "cnn-drqn": "CNN-DRQN",
+                "cnn-histformer": "CNN-HistFormer",
             }
             algo_seed_offset = {
                 "mlp-dqn": 20_000,
@@ -2363,12 +2548,19 @@ def main(argv: list[str] | None = None) -> int:
                 "cnn-sac": 80_000,
                 "cnn-td3": 110_000,
                 "cnn-td3-local": 120_000,
+                "cnn-dual-ddqn": 130_000,
+                "cnn-drqn": 140_000,
+                "cnn-histformer": 150_000,
             }
 
             def resolve_model_path(algo: str) -> Path:
                 p = models_dir / env_base / f"{algo}.pt"
                 if p.exists():
                     return p
+                # V36-A/C: train_one_drqn/histformer save directly under models/
+                p_flat = models_dir / f"{algo}.pt"
+                if p_flat.exists():
+                    return p_flat
                 legacy = {
                     "mlp-dqn": "dqn",
                     "mlp-ddqn": "ddqn",
@@ -2392,7 +2584,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             # Check obs_dim consistency (skip SAC checkpoints which have different format)
-            dqn_algo_paths = {a: p for a, p in algo_paths.items() if str(a) not in ("cnn-sac", "cnn-td3", "cnn-td3-local")}
+            dqn_algo_paths = {a: p for a, p in algo_paths.items() if str(a) not in ("cnn-sac", "cnn-td3", "cnn-td3-local", "cnn-dual-ddqn", "cnn-drqn", "cnn-histformer")}
             if dqn_algo_paths:
                 ckpt_obs_dim = infer_checkpoint_obs_dim(next(iter(dqn_algo_paths.values())))
                 for path in dqn_algo_paths.values():
@@ -2444,6 +2636,22 @@ def main(argv: list[str] | None = None) -> int:
                     tl = TD3Agent(td3l_cfg, device=str(device), seed=args.seed)
                     tl.load(path)
                     agents[str(algo)] = tl  # stored separately, not in sac_agents
+                elif str(algo) == "cnn-dual-ddqn":
+                    # DualScale: obs_dim from DualScaleWrapper (16×16 → 410)
+                    from forest_vehicle_dqn.networks import DualScaleCNNQNetwork
+                    a = DQNFamilyAgent("cnn-dual-ddqn", DualScaleCNNQNetwork.TOTAL_OBS_DIM, n_actions, config=agent_cfg, seed=args.seed, device=device)
+                    a.load(path)
+                    agents[str(algo)] = a
+                elif str(algo) == "cnn-drqn":
+                    from forest_vehicle_dqn.agents import DRQNAgent
+                    d = DRQNAgent(obs_dim, n_actions, config=agent_cfg, device=device, seed=args.seed)
+                    d.load(path)
+                    agents[str(algo)] = d
+                elif str(algo) == "cnn-histformer":
+                    from forest_vehicle_dqn.agents import HistFormerAgent
+                    h = HistFormerAgent(obs_dim, n_actions, config=agent_cfg, device=device, seed=args.seed)
+                    h.load(path)
+                    agents[str(algo)] = h
                 else:
                     a = DQNFamilyAgent(str(algo), obs_dim, n_actions, config=agent_cfg, seed=args.seed, device=device)
                     a.load(path)
@@ -2500,6 +2708,48 @@ def main(argv: list[str] | None = None) -> int:
                             reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
                             time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
                             collect_controls=bool(int(i) in control_run_indices),
+                        )
+                    elif algo_key == "cnn-dual-ddqn" and isinstance(env, AMRBicycleEnv):
+                        from forest_vehicle_dqn.env import DualScaleWrapper
+                        dual_env = DualScaleWrapper(env)
+                        roll = rollout_agent(
+                            dual_env, agents[algo_key],
+                            max_steps=args.max_steps,
+                            seed=int(args.seed) + seed_base + int(i),
+                            reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
+                            time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
+                            forest_adm_horizon=int(args.forest_adm_horizon),
+                            forest_adm_persistence=int(args.forest_adm_persistence),
+                            forest_topk=int(args.forest_topk),
+                            forest_min_od_m=float(args.forest_min_od_m),
+                            forest_min_progress_m=float(args.forest_min_progress_m),
+                            forest_no_fallback=bool(getattr(args, "forest_no_fallback", False)),
+                            collect_controls=bool(int(i) in control_run_indices),
+                            trace_path=trace_path,
+                        )
+                    elif algo_key == "cnn-drqn" and isinstance(env, AMRBicycleEnv):
+                        roll = rollout_drqn(
+                            env, agents[algo_key],
+                            max_steps=args.max_steps,
+                            seed=int(args.seed) + seed_base + int(i),
+                            reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
+                            time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
+                            forest_adm_horizon=int(args.forest_adm_horizon),
+                            forest_topk=int(args.forest_topk),
+                            forest_min_od_m=float(args.forest_min_od_m),
+                            forest_min_progress_m=float(args.forest_min_progress_m),
+                        )
+                    elif algo_key == "cnn-histformer" and isinstance(env, AMRBicycleEnv):
+                        roll = rollout_histformer(
+                            env, agents[algo_key],
+                            max_steps=args.max_steps,
+                            seed=int(args.seed) + seed_base + int(i),
+                            reset_options=reset_options_list[i] if i < len(reset_options_list) else None,
+                            time_mode=str(getattr(args, "kpi_time_mode", "rollout")),
+                            forest_adm_horizon=int(args.forest_adm_horizon),
+                            forest_topk=int(args.forest_topk),
+                            forest_min_od_m=float(args.forest_min_od_m),
+                            forest_min_progress_m=float(args.forest_min_progress_m),
                         )
                     elif algo_key in sac_agents and isinstance(env, AMRBicycleEnv):
                         roll = rollout_sac(

@@ -547,6 +547,48 @@ def bilinear_sample_2d_finite_vec(
     return np.where(mask, out, outside).astype(np.float64, copy=False)
 
 
+def geodesic_goal_dist_m(
+    grid: np.ndarray,
+    *,
+    goal_xy: tuple[int, int],
+    cell_size_m: float,
+) -> np.ndarray:
+    """Dijkstra-based geodesic distance from every free cell to goal (meters).
+
+    Unlike ``euclidean_goal_dist_m`` this routes **around** obstacles,
+    giving the true shortest-path distance through free space.
+    Obstacle / unreachable cells are filled with ``np.inf``.
+    """
+    import heapq
+
+    h, w = int(grid.shape[0]), int(grid.shape[1])
+    gx, gy = int(goal_xy[0]), int(goal_xy[1])
+    cell = float(cell_size_m)
+    diag = cell * math.sqrt(2.0)
+
+    INF = float("inf")
+    dist = np.full((h, w), INF, dtype=np.float64)
+    dist[gy, gx] = 0.0
+
+    heap: list[tuple[float, int, int]] = [(0.0, gy, gx)]
+    NEIGHBORS = (
+        (-1, 0, cell), (1, 0, cell), (0, -1, cell), (0, 1, cell),
+        (-1, -1, diag), (-1, 1, diag), (1, -1, diag), (1, 1, diag),
+    )
+    while heap:
+        d, cy, cx = heapq.heappop(heap)
+        if d > dist[cy, cx]:
+            continue
+        for dy, dx, cost in NEIGHBORS:
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < h and 0 <= nx < w and grid[ny, nx] == 0:
+                nd = d + cost
+                if nd < dist[ny, nx]:
+                    dist[ny, nx] = nd
+                    heapq.heappush(heap, (nd, ny, nx))
+    return dist.astype(np.float32, copy=False)
+
+
 def euclidean_goal_dist_m(
     shape_hw: tuple[int, int],
     *,
@@ -642,6 +684,8 @@ class AMRBicycleEnv(gym.Env):
         # Exponential potential-based shaping (v8p3)
         reward_potential_base: float = 0.0,
         reward_potential_bias: float = 0.0,
+        obs_geodesic_goal_dist: bool = False,
+        reward_geodesic_progress: bool = False,
     ) -> None:
         super().__init__()
 
@@ -675,6 +719,9 @@ class AMRBicycleEnv(gym.Env):
         self.obs_map_size = int(obs_map_size)
         if self.obs_map_size < 4:
             raise ValueError("obs_map_size must be >= 4")
+        self.obs_geodesic_goal_dist = bool(obs_geodesic_goal_dist)
+        self.reward_geodesic_progress = bool(reward_geodesic_progress)
+        self._geo_reward_field: "np.ndarray | None" = None
         self.od_cap_m = float(od_cap_m)
         if not (self.od_cap_m > 0):
             raise ValueError("od_cap_m must be > 0")
@@ -732,6 +779,10 @@ class AMRBicycleEnv(gym.Env):
         # Candidate free cells for random start/goal sampling.
         free_y, free_x = np.where(self._traversable_base)
         self._rand_free_xy = np.stack([free_x, free_y], axis=1).astype(np.int32, copy=False)
+
+        # Placeholder for geodesic goal-distance channel (filled in _set_goal_xy).
+        msq = int(self.obs_map_size) * int(self.obs_map_size)
+        self._obs_geodist_flat = np.ones(msq, dtype=np.float32)  # +1 = max dist
 
         # Goal-dependent fields (distance field + curriculum candidates).
         self._set_goal_xy(self.goal_xy)
@@ -850,7 +901,9 @@ class AMRBicycleEnv(gym.Env):
         ).astype(np.float32, copy=False)
         self._obs_occ_flat = (2.0 * occ_ds.reshape(-1) - 1.0).astype(np.float32, copy=False)
 
-        obs_dim = 10 + int(self.obs_map_size) * int(self.obs_map_size)
+        msq = int(self.obs_map_size) * int(self.obs_map_size)
+        map_ch = 2 if self.obs_geodesic_goal_dist else 1
+        obs_dim = 10 + map_ch * msq
         self.observation_space = gym.spaces.Box(
             low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32
         )
@@ -926,6 +979,26 @@ class AMRBicycleEnv(gym.Env):
             cell_size_m=self.cell_size_m,
         )
         self._goal_dist_fill_m = float(self._diag_m) + float(self.cell_size_m)
+
+        # Geodesic distance field: shared for obs channel and/or reward shaping.
+        if self.obs_geodesic_goal_dist or self.reward_geodesic_progress:
+            geo = geodesic_goal_dist_m(
+                self._grid, goal_xy=self.goal_xy, cell_size_m=self.cell_size_m,
+            )
+            if self.reward_geodesic_progress:
+                self._geo_reward_field = geo  # full-res, meters
+            if self.obs_geodesic_goal_dist:
+                geo_ds = cv2.resize(
+                    geo, dsize=(int(self.obs_map_size), int(self.obs_map_size)),
+                    interpolation=cv2.INTER_AREA,
+                ).astype(np.float32, copy=False)
+                finite = geo_ds[np.isfinite(geo_ds)]
+                max_d = float(finite.max()) if finite.size > 0 else 1.0
+                max_d = max(max_d, 1e-6)
+                normed = np.where(np.isfinite(geo_ds), geo_ds / max_d, 1.0)
+                self._obs_geodist_flat = (2.0 * normed.reshape(-1) - 1.0).astype(
+                    np.float32, copy=False
+                )
 
         # Curriculum: candidate start cells (reachable under clearance + minimum goal distance).
         self._curriculum_min_dist_m = float(max(self.goal_tolerance_m + self.cell_size_m, 1.0))
@@ -1368,7 +1441,11 @@ class AMRBicycleEnv(gym.Env):
                     reward += self.reward_c_prog * (float(d_goal_before) - self._gamma * float(d_goal_after))
         else:
             # Legacy k_p progress reward
-            if math.isfinite(dist_before) and math.isfinite(dist_after):
+            if self.reward_geodesic_progress:
+                geo_b = self._geo_reward_dist(x_before, y_before)
+                geo_a = self._geo_reward_dist(float(self._x_m), float(self._y_m))
+                reward += self.reward_k_p * float(geo_b - geo_a)
+            elif math.isfinite(dist_before) and math.isfinite(dist_after):
                 reward += self.reward_k_p * float(dist_before - dist_after)
             else:
                 reward += self.reward_k_p * float(d_goal_before - d_goal_after)
@@ -1753,8 +1830,12 @@ class AMRBicycleEnv(gym.Env):
         delta_dot_rad_s: np.ndarray,
         a_m_s2: np.ndarray,
         horizon_steps: int,
+        action_persistence: int = 0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         h = max(1, int(horizon_steps))
+        persist = max(0, int(action_persistence))
+        if persist <= 0:
+            persist = h  # full-horizon constant (backward compatible)
         delta_dot = np.asarray(delta_dot_rad_s, dtype=np.float64).reshape(-1)
         accel = np.asarray(a_m_s2, dtype=np.float64).reshape(-1)
         if delta_dot.shape != accel.shape:
@@ -1776,9 +1857,19 @@ class AMRBicycleEnv(gym.Env):
         gy_m = float(self.goal_xy[1]) * float(self.cell_size_m)
         tol_m = float(self.goal_tolerance_m)
 
-        for _ in range(h):
+        for _k in range(h):
             if not bool(active.any()):
                 break
+
+            # Decay action toward neutral after persistence window.
+            if _k < persist:
+                dd_eff = delta_dot
+                acc_eff = accel
+            else:
+                remaining = max(1, h - persist)
+                alpha = max(0.0, 1.0 - float(_k - persist) / float(remaining))
+                dd_eff = delta_dot * alpha
+                acc_eff = accel * alpha
 
             x1, y1, psi1, v1, delta1 = self._bicycle_integrate_one_step_vec(
                 x_m=x,
@@ -1786,8 +1877,8 @@ class AMRBicycleEnv(gym.Env):
                 psi_rad=psi,
                 v_m_s=v,
                 delta_rad=delta,
-                delta_dot_rad_s=delta_dot,
-                a_m_s2=accel,
+                delta_dot_rad_s=dd_eff,
+                a_m_s2=acc_eff,
             )
             # Freeze terminated rollouts (reached/collided) so later steps do not affect masks.
             x = np.where(active, x1, x)
@@ -1814,6 +1905,7 @@ class AMRBicycleEnv(gym.Env):
         *,
         horizon_steps: int,
         min_od_m: float = 0.0,
+        action_persistence: int = 0,
     ) -> int:
         """Fallback action chooser when Hybrid A* guidance is unavailable.
 
@@ -1829,6 +1921,7 @@ class AMRBicycleEnv(gym.Env):
             delta_dot_rad_s=delta_dot,
             a_m_s2=accel,
             horizon_steps=h,
+            action_persistence=int(action_persistence),
         )
         dist1 = self._goal_dist_pose_m_vec(x, y, psi)
 
@@ -2216,6 +2309,7 @@ class AMRBicycleEnv(gym.Env):
         a_id: int,
         *,
         horizon_steps: int,
+        action_persistence: int = 0,
     ) -> tuple[float, float, float, bool, bool]:
         """Simulate a constant discrete action for a short horizon.
 
@@ -2223,10 +2317,13 @@ class AMRBicycleEnv(gym.Env):
         """
 
         h = max(1, int(horizon_steps))
+        persist = max(0, int(action_persistence))
+        if persist <= 0:
+            persist = h
         a_id = int(a_id)
 
-        delta_dot = float(self.action_table[a_id, 0])
-        a = float(self.action_table[a_id, 1])
+        delta_dot_orig = float(self.action_table[a_id, 0])
+        a_orig = float(self.action_table[a_id, 1])
 
         x = float(self._x_m)
         y = float(self._y_m)
@@ -2239,15 +2336,23 @@ class AMRBicycleEnv(gym.Env):
         tol_m = float(self.goal_tolerance_m)
 
         min_od = float("inf")
-        for _ in range(h):
+        for _k in range(h):
+            if _k < persist:
+                dd_eff = delta_dot_orig
+                a_eff = a_orig
+            else:
+                remaining = max(1, h - persist)
+                alpha = max(0.0, 1.0 - float(_k - persist) / float(remaining))
+                dd_eff = delta_dot_orig * alpha
+                a_eff = a_orig * alpha
             x, y, psi, v, delta = bicycle_integrate_one_step(
                 x_m=x,
                 y_m=y,
                 psi_rad=psi,
                 v_m_s=v,
                 delta_rad=delta,
-                delta_dot_rad_s=delta_dot,
-                a_m_s2=a,
+                delta_dot_rad_s=dd_eff,
+                a_m_s2=a_eff,
                 params=self.model,
             )
             od, coll = self._od_and_collision_at_pose_m(x, y, psi)
@@ -2268,9 +2373,10 @@ class AMRBicycleEnv(gym.Env):
         *,
         horizon_steps: int = 10,
         min_od_m: float = 0.0,
+        action_persistence: int = 0,
     ) -> bool:
         _goal_dist, _v, min_od, coll, _reached = self._rollout_constant_action_metrics(
-            int(a_id), horizon_steps=int(horizon_steps)
+            int(a_id), horizon_steps=int(horizon_steps), action_persistence=int(action_persistence)
         )
         if bool(coll):
             return False
@@ -2284,6 +2390,7 @@ class AMRBicycleEnv(gym.Env):
         min_od_m: float = 0.0,
         min_progress_m: float = 1e-4,
         allow_reverse: bool = True,
+        action_persistence: int = 0,
     ) -> bool:
         dist0 = float(self._goal_dist_pose_m(float(self._x_m), float(self._y_m), float(self._psi_rad)))
         if not math.isfinite(dist0):
@@ -2299,7 +2406,9 @@ class AMRBicycleEnv(gym.Env):
         # Progress is judged at the end of the short-horizon constant-action rollout, while safety
         # (collision / clearance) is judged over the same horizon.
         h = max(1, int(horizon_steps))
-        dist1, v_end, min_od, coll, reached = self._rollout_constant_action_metrics(int(a_id), horizon_steps=h)
+        dist1, v_end, min_od, coll, reached = self._rollout_constant_action_metrics(
+            int(a_id), horizon_steps=h, action_persistence=int(action_persistence)
+        )
         if bool(coll):
             return False
         if float(min_od) < float(min_od_m):
@@ -2327,6 +2436,7 @@ class AMRBicycleEnv(gym.Env):
                     min_progress_m=float(min_progress_m),
                     fallback_to_safe=False,
                     allow_reverse=False,
+                    action_persistence=int(action_persistence),
                 )
                 if not bool(prog_mask.any()):
                     return True
@@ -2337,6 +2447,7 @@ class AMRBicycleEnv(gym.Env):
         *,
         horizon_steps: int = 10,
         min_od_m: float = 0.0,
+        action_persistence: int = 0,
     ) -> np.ndarray:
         """Return a boolean mask of actions that remain collision-free over a short horizon."""
         h = max(1, int(horizon_steps))
@@ -2347,6 +2458,7 @@ class AMRBicycleEnv(gym.Env):
             delta_dot_rad_s=delta_dot,
             a_m_s2=accel,
             horizon_steps=h,
+            action_persistence=int(action_persistence),
         )
         out = (~coll) & (min_od >= float(min_od_thr))
         return out.astype(np.bool_, copy=False)
@@ -2359,6 +2471,7 @@ class AMRBicycleEnv(gym.Env):
         min_progress_m: float = 1e-4,
         fallback_to_safe: bool = True,
         allow_reverse: bool = True,
+        action_persistence: int = 0,
     ) -> np.ndarray:
         """Mask actions that are safe and make goal-distance progress (optionally allow reverse)."""
 
@@ -2385,6 +2498,7 @@ class AMRBicycleEnv(gym.Env):
             delta_dot_rad_s=delta_dot,
             a_m_s2=accel,
             horizon_steps=h,
+            action_persistence=int(action_persistence),
         )
         dist1 = self._goal_dist_pose_m_vec(x, y, psi)
 
@@ -2434,16 +2548,37 @@ class AMRBicycleEnv(gym.Env):
         v_n = float(np.clip(v_n, -1.0, 1.0))
         delta_n = float(np.clip(delta_n, -1.0, 1.0))
         alpha_n = float(np.clip(alpha_n, -1.0, 1.0))
-        obs = np.concatenate(
-            [
-                np.array(
-                    [ax_n, ay_n, gx_n, gy_n, sin_psi, cos_psi, v_n, delta_n, alpha_n, od_n],
-                    dtype=np.float32,
-                ),
-                self._obs_occ_flat,
-            ]
-        )
+        parts = [
+            np.array(
+                [ax_n, ay_n, gx_n, gy_n, sin_psi, cos_psi, v_n, delta_n, alpha_n, od_n],
+                dtype=np.float32,
+            ),
+            self._obs_occ_flat,
+        ]
+        if self.obs_geodesic_goal_dist:
+            parts.append(self._obs_geodist_flat)
+        obs = np.concatenate(parts)
         return obs.astype(np.float32, copy=False)
+
+    def global_map_flat(self, global_size: int = 8, radius_cells: int = 48) -> np.ndarray:
+        """Agent-centered global occupancy map, downsampled to global_size×global_size.
+
+        Extracts a 2*radius_cells × 2*radius_cells window around the agent
+        from self._grid, pads with obstacle value at boundaries, downsamples,
+        and normalizes to [-1, 1]. Returns flat array of shape (global_size²,).
+        """
+        ax = int(round(float(self._x_m) / self.cell_size_m))
+        ay = int(round(float(self._y_m) / self.cell_size_m))
+        H, W = int(self._height), int(self._width)
+        r = int(radius_cells)
+        patch = np.ones((2 * r, 2 * r), dtype=np.float32)  # default: obstacle
+        y0, y1 = max(0, ay - r), min(H, ay + r)
+        x0, x1 = max(0, ax - r), min(W, ax + r)
+        py0, py1 = r - (ay - y0), r + (y1 - ay)
+        px0, px1 = r - (ax - x0), r + (x1 - ax)
+        patch[py0:py1, px0:px1] = self._grid[y0:y1, x0:x1].astype(np.float32)
+        small = cv2.resize(patch, (global_size, global_size), interpolation=cv2.INTER_AREA)
+        return (2.0 * small - 1.0).flatten().astype(np.float32)
 
     def _distance_to_goal_m(self) -> float:
         gx = float(self.goal_xy[0]) * self.cell_size_m
@@ -2460,6 +2595,15 @@ class AMRBicycleEnv(gym.Env):
         xi = float(x_m) / self.cell_size_m
         yi = float(y_m) / self.cell_size_m
         return bilinear_sample_2d(self._goal_dist_m, x=xi, y=yi, default=float(self._goal_dist_fill_m))
+
+    def _geo_reward_dist(self, x_m: float, y_m: float) -> float:
+        """Geodesic distance to goal at continuous position (meters), grid lookup."""
+        if self._geo_reward_field is None:
+            return float("inf")
+        xi = max(0, min(int(round(float(x_m) / self.cell_size_m)), self._width - 1))
+        yi = max(0, min(int(round(float(y_m) / self.cell_size_m)), self._height - 1))
+        val = float(self._geo_reward_field[yi, xi])
+        return val if math.isfinite(val) else float(self._diag_m)
 
     def _goal_dist_pose_m(self, x_m: float, y_m: float, psi_rad: float) -> float:
         """Goal distance for the whole vehicle footprint (two circles).
@@ -2597,3 +2741,41 @@ class AMRBicycleEnv(gym.Env):
         ], dtype=np.float32)
 
         return {"maps": maps, "scalars": scalars}
+
+
+# ---------------------------------------------------------------------------
+# V36-B: DualScaleWrapper — appends global 16×16 map to AMRBicycleEnv obs
+# ---------------------------------------------------------------------------
+
+class DualScaleWrapper(gym.Wrapper):
+    """Gym wrapper: appends global_map_flat() to AMRBicycleEnv obs.
+
+    obs_dim: 154 (base) + 256 (global 16×16) = 410.
+    """
+
+    GLOBAL_SIZE: int = 16
+    RADIUS_CELLS: int = 48
+
+    def __init__(self, env: "AMRBicycleEnv") -> None:
+        super().__init__(env)
+        base_dim = int(env.observation_space.shape[0])
+        total_dim = base_dim + self.GLOBAL_SIZE * self.GLOBAL_SIZE
+        self.observation_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(total_dim,), dtype=np.float32
+        )
+
+    def _aug(self, obs: np.ndarray) -> np.ndarray:
+        gmap = self.env.global_map_flat(self.GLOBAL_SIZE, self.RADIUS_CELLS)
+        return np.concatenate([obs, gmap]).astype(np.float32)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._aug(obs), info
+
+    def step(self, action):
+        obs, reward, done, trunc, info = self.env.step(action)
+        return self._aug(obs), reward, done, trunc, info
+
+    def __getattr__(self, name: str):
+        """Forward attribute access to the wrapped AMRBicycleEnv."""
+        return getattr(self.env, name)

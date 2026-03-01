@@ -53,7 +53,7 @@ def infer_flat_obs_cnn_layout(obs_dim: int) -> FlatObsCnnLayout:
         raise ValueError("obs_dim must be > 0")
 
     candidates: list[FlatObsCnnLayout] = []
-    for scalar_dim, channels in ((5, 1), (10, 1)):
+    for scalar_dim, channels in ((5, 1), (10, 1), (10, 2)):
         rem = d - int(scalar_dim)
         if rem <= 0:
             continue
@@ -66,7 +66,7 @@ def infer_flat_obs_cnn_layout(obs_dim: int) -> FlatObsCnnLayout:
 
     if not candidates:
         raise ValueError(
-            f"Cannot infer CNN layout from obs_dim={d}. Expected 5+N^2 (grid) or 10+N^2 (bicycle)."
+            f"Cannot infer CNN layout from obs_dim={d}. Expected 5+N^2, 10+N^2, or 10+2*N^2."
         )
     if len(candidates) > 1:
         raise ValueError(f"Ambiguous CNN layout for obs_dim={d}: {candidates}")
@@ -220,3 +220,241 @@ class CNNQNetwork(nn.Module):
         for m in self.modules():
             if isinstance(m, NoisyLinear):
                 m.reset_noise()
+
+
+# ---------------------------------------------------------------------------
+# V36-B: Dual-Scale CNN-DQN (local 12×12 + global 16×16, GAP)
+# ---------------------------------------------------------------------------
+
+class DualScaleCNNQNetwork(nn.Module):
+    """Dual-scale CNN: local 12×12 map + global 16×16 map → Q(n_actions).
+
+    obs layout (flat): [scalar_dim=10] | [local 12×12=144] | [global 16×16=256]
+    Total obs_dim = 410.  Same interface as CNNQNetwork for drop-in use.
+
+    Global branch uses 2-layer Conv + Global Average Pooling (GAP) to keep
+    d_global=32, so fc_in=618 ≈ standard DDQN 586 (+5% only).
+    """
+
+    SCALAR_DIM: int = 10
+    LOCAL_MAP_SIZE: int = 12
+    GLOBAL_MAP_SIZE: int = 16
+    LOCAL_OBS_DIM: int = 10 + 12 * 12   # 154
+    TOTAL_OBS_DIM: int = 10 + 144 + 256  # 410
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        hidden_dim: int = 256,
+        hidden_layers: int = 2,
+        **kwargs,  # absorb unused kwargs (dueling, cbam, mha, etc.)
+    ) -> None:
+        super().__init__()
+        if int(input_dim) != self.TOTAL_OBS_DIM:
+            raise ValueError(
+                f"DualScaleCNNQNetwork expects input_dim={self.TOTAL_OBS_DIM}, got {input_dim}"
+            )
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+
+        # Local branch: same 3-conv as V16-C (12×12 → 3×3 feature map)
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+
+        # Global branch: 2-conv + GAP for 16×16 map → d_global=32
+        # 16×16 → 8×8 (stride-2) → 4×4 (stride-2) → 1×1 (GAP) → 32-dim
+        self.global_conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            d_local = self.local_conv(
+                torch.zeros(1, 1, self.LOCAL_MAP_SIZE, self.LOCAL_MAP_SIZE)
+            ).flatten(1).shape[1]
+            # global_conv already ends with Flatten; output shape is (1, d_global)
+            d_global = self.global_conv(
+                torch.zeros(1, 1, self.GLOBAL_MAP_SIZE, self.GLOBAL_MAP_SIZE)
+            ).shape[1]
+
+        fc_in = self.SCALAR_DIM + d_local + d_global
+        layers: list[nn.Module] = [nn.Linear(fc_in, hidden_dim), nn.ReLU()]
+        for _ in range(hidden_layers - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.head = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        scalars = x[:, :self.SCALAR_DIM]
+        local_flat = x[:, self.SCALAR_DIM:self.LOCAL_OBS_DIM]
+        global_flat = x[:, self.LOCAL_OBS_DIM:]
+        lf = self.local_conv(local_flat.reshape(B, 1, self.LOCAL_MAP_SIZE, self.LOCAL_MAP_SIZE)).flatten(1)
+        gf = self.global_conv(global_flat.reshape(B, 1, self.GLOBAL_MAP_SIZE, self.GLOBAL_MAP_SIZE))  # already flattened by GAP+Flatten
+        feats = torch.cat([scalars, lf, gf], dim=1)
+        return self.head(feats)
+
+    def reset_noise(self) -> None:
+        pass  # no NoisyLinear in DualScaleCNNQNetwork
+
+
+# ---------------------------------------------------------------------------
+# V36-A: DRQN — CNN encoder → LSTM → Q-head
+# ---------------------------------------------------------------------------
+
+class DRQNNetwork(nn.Module):
+    """Recurrent DQN: CNN(obs) → fc → LSTM(hidden_dim) → Q(n_actions).
+
+    forward(x, hidden) accepts:
+      x: (B, obs_dim) for single-step inference   (hidden maintained externally)
+      x: (B, T, obs_dim) for sequence training    (returns (B, T, n_actions), hidden)
+    Returns (q, hidden_out).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        scalar_dim: int = 10,
+        map_size: int = 12,
+        hidden_dim: int = 256,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.scalar_dim = int(scalar_dim)
+        self.map_size = int(map_size)
+        self.hidden_dim = int(hidden_dim)
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            conv_dim = self.conv(torch.zeros(1, 1, map_size, map_size)).flatten(1).shape[1]
+        self.fc = nn.Sequential(nn.Linear(scalar_dim + conv_dim, hidden_dim), nn.ReLU())
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.head = nn.Linear(hidden_dim, output_dim)
+
+    def init_hidden(self, batch_size: int = 1, device: torch.device | None = None) -> tuple:
+        dev = device or next(self.parameters()).device
+        h = torch.zeros(1, batch_size, self.hidden_dim, device=dev)
+        c = torch.zeros(1, batch_size, self.hidden_dim, device=dev)
+        return (h, c)
+
+    def forward(self, x: torch.Tensor, hidden=None):
+        seq = x.dim() == 3
+        if not seq:
+            x = x.unsqueeze(1)  # (B, 1, obs_dim)
+        B, T, _ = x.shape
+        sc = x[:, :, :self.scalar_dim]
+        mp = x[:, :, self.scalar_dim:].reshape(B * T, 1, self.map_size, self.map_size)
+        cf = self.conv(mp).flatten(1).reshape(B, T, -1)
+        feats = self.fc(torch.cat([sc, cf], dim=-1).reshape(B * T, -1)).reshape(B, T, -1)
+        out, hidden = self.lstm(feats, hidden)
+        q = self.head(out)
+        if not seq:
+            q = q.squeeze(1)
+        return q, hidden
+
+    def reset_noise(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# V36-C: HistTransformerNetwork — CNN → rolling T-step buffer → Transformer → Q
+# ---------------------------------------------------------------------------
+
+class HistTransformerNetwork(nn.Module):
+    """History Transformer DQN: CNN(obs) → fc → TransformerEncoder(T steps) → Q.
+
+    Unlike spatial MHA (V11), this attends over the TIME axis (last T obs features).
+    forward(x, hist_buf) accepts:
+      x: (B, obs_dim) single-step
+      hist_buf: (B, T, d_model) rolling feature buffer (caller manages)
+    Returns (q, updated_hist_buf).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        scalar_dim: int = 10,
+        map_size: int = 12,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 2,
+        seq_len: int = 8,
+        hidden_dim: int = 256,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self.scalar_dim = int(scalar_dim)
+        self.map_size = int(map_size)
+        self.d_model = int(d_model)
+        self.seq_len = int(seq_len)
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+        with torch.no_grad():
+            conv_dim = self.conv(torch.zeros(1, 1, map_size, map_size)).flatten(1).shape[1]
+        self.proj = nn.Linear(scalar_dim + conv_dim, d_model)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
+            dropout=0.0, batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def encode_step(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode single obs → feature vector (B, d_model)."""
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        sc = x[:, :self.scalar_dim]
+        mp = x[:, self.scalar_dim:].reshape(B, 1, self.map_size, self.map_size)
+        cf = self.conv(mp).flatten(1)
+        return self.proj(torch.cat([sc, cf], dim=1))
+
+    def forward(self, hist_buf: torch.Tensor) -> torch.Tensor:
+        """hist_buf: (B, T, d_model) → q: (B, n_actions)."""
+        out = self.transformer(hist_buf)          # (B, T, d_model)
+        return self.head(out[:, -1, :])           # use last token
+
+    def reset_noise(self) -> None:
+        pass
+
+
+

@@ -2910,6 +2910,161 @@ def train_one_td3_local(
                                          "episodes": episodes}}
 
 
+# ---------------------------------------------------------------------------
+# V36-A: train_one_drqn — DRQN training loop
+# ---------------------------------------------------------------------------
+
+def train_one_drqn(
+    env,
+    *,
+    episodes: int = 300,
+    config,
+    seed: int = 0,
+    out_dir,
+    forest_reward_k_p: float = 12.0,
+    forest_reward_k_len: float = 0.10,
+    forest_adm_horizon: int = 45,
+    forest_random_start_goal: bool = True,
+    forest_rand_min_dist_m: float = 6.0,
+    forest_rand_max_dist_m=None,
+    forest_rand_fixed_prob: float = 0.0,
+    forest_rand_tries: int = 100,
+    forest_rand_edge_margin_m: float = 2.0,
+    forest_train_two_suites: bool = False,
+    forest_train_short_prob: float = 0.5,
+    forest_train_short_min_dist_m: float = 6.0,
+    forest_train_long_min_dist_m: float = 42.0,
+    device: str | torch.device = "cpu",
+    progress=None,
+    seq_len: int = 8,
+):
+    from forest_vehicle_dqn.agents import DRQNAgent
+    from pathlib import Path as _Path
+    out_dir = _Path(out_dir)
+    model_dir = out_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    _pw = make_progress_writer(bool(progress)) if not callable(progress) else None
+
+    obs_dim = int(env.observation_space.shape[0])
+    n_actions = int(env.action_space.n)
+    agent = DRQNAgent(obs_dim, n_actions, config=config, device=device, seed=seed, seq_len=seq_len)
+
+    returns: list[float] = []
+    best_return = float("-inf")
+    rng_ep = np.random.default_rng(seed + 7777)
+
+    for ep in range(int(episodes)):
+        agent.reset_episode()
+        reset_opts: dict = {}
+        if forest_random_start_goal:
+            if forest_train_two_suites and rng_ep.random() < float(forest_train_short_prob):
+                reset_opts = {"min_dist_m": float(forest_train_short_min_dist_m),
+                              "max_dist_m": 14.0, "rand_tries": int(forest_rand_tries)}
+            else:
+                reset_opts = {"min_dist_m": float(forest_train_long_min_dist_m),
+                              "rand_tries": int(forest_rand_tries)}
+        obs, _info = env.reset(seed=int(seed + ep), options=reset_opts if reset_opts else None)
+        total_r = 0.0
+        max_steps = int(getattr(env, "max_steps", 1000))
+        for _step in range(max_steps):
+            action = agent.act(obs, explore=True)
+            next_obs, reward, done, trunc, _info = env.step(action)
+            agent.observe(obs, action, float(reward), next_obs, bool(done or trunc))
+            agent.train_step()
+            obs = next_obs
+            total_r += float(reward)
+            if done or trunc:
+                break
+        returns.append(total_r)
+        if total_r > best_return:
+            best_return = total_r
+            agent.save(model_dir / "cnn-drqn.pt")
+        if _pw is not None:
+            _pw(f"[drqn] ep={ep+1}/{episodes} r={total_r:.1f}")
+    # Flush last episode
+    if agent._cur_ep:
+        agent.replay.add_episode(agent._cur_ep)
+    agent.save(model_dir / "cnn-drqn-final.pt")
+    return agent, np.array(returns), [], {"meta": {"algo": "cnn-drqn", "episodes": episodes}}
+
+
+# ---------------------------------------------------------------------------
+# V36-C: train_one_histformer — HistTransformer training loop
+# ---------------------------------------------------------------------------
+
+def train_one_histformer(
+    env,
+    *,
+    episodes: int = 300,
+    config,
+    seed: int = 0,
+    out_dir,
+    forest_reward_k_p: float = 12.0,
+    forest_reward_k_len: float = 0.10,
+    forest_adm_horizon: int = 45,
+    forest_random_start_goal: bool = True,
+    forest_rand_min_dist_m: float = 6.0,
+    forest_rand_max_dist_m=None,
+    forest_rand_fixed_prob: float = 0.0,
+    forest_rand_tries: int = 100,
+    forest_rand_edge_margin_m: float = 2.0,
+    forest_train_two_suites: bool = False,
+    forest_train_short_prob: float = 0.5,
+    forest_train_short_min_dist_m: float = 6.0,
+    forest_train_long_min_dist_m: float = 42.0,
+    device: str | torch.device = "cpu",
+    progress=None,
+    seq_len: int = 8,
+):
+    from forest_vehicle_dqn.agents import HistFormerAgent
+    from pathlib import Path as _Path
+    out_dir = _Path(out_dir)
+    model_dir = out_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    _pw = make_progress_writer(bool(progress)) if not callable(progress) else None
+
+    obs_dim = int(env.observation_space.shape[0])
+    n_actions = int(env.action_space.n)
+    agent = HistFormerAgent(obs_dim, n_actions, config=config, device=device, seed=seed, seq_len=seq_len)
+
+    returns: list[float] = []
+    best_return = float("-inf")
+    rng_ep = np.random.default_rng(seed + 8888)
+
+    for ep in range(int(episodes)):
+        agent.reset_episode()
+        reset_opts: dict = {}
+        if forest_random_start_goal:
+            if forest_train_two_suites and rng_ep.random() < float(forest_train_short_prob):
+                reset_opts = {"min_dist_m": float(forest_train_short_min_dist_m),
+                              "max_dist_m": 14.0, "rand_tries": int(forest_rand_tries)}
+            else:
+                reset_opts = {"min_dist_m": float(forest_train_long_min_dist_m),
+                              "rand_tries": int(forest_rand_tries)}
+        obs, _info = env.reset(seed=int(seed + ep), options=reset_opts if reset_opts else None)
+        total_r = 0.0
+        max_steps = int(getattr(env, "max_steps", 1000))
+        for _step in range(max_steps):
+            action = agent.act(obs, explore=True)
+            next_obs, reward, done, trunc, _info = env.step(action)
+            agent.observe(obs, action, float(reward), next_obs, bool(done or trunc))
+            agent.train_step()
+            obs = next_obs
+            total_r += float(reward)
+            if done or trunc:
+                break
+        returns.append(total_r)
+        if total_r > best_return:
+            best_return = total_r
+            agent.save(model_dir / "cnn-histformer.pt")
+        if _pw is not None:
+            _pw(f"[histformer] ep={ep+1}/{episodes} r={total_r:.1f}")
+    if agent._cur_ep:
+        agent.replay.add_episode(agent._cur_ep)
+    agent.save(model_dir / "cnn-histformer-final.pt")
+    return agent, np.array(returns), [], {"meta": {"algo": "cnn-histformer", "episodes": episodes}}
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Train RL agents (default: DQN) and generate Fig. 13-style reward curves.")
     ap.add_argument(
@@ -3960,7 +4115,7 @@ def main(argv: list[str] | None = None) -> int:
     if bool(getattr(args, "forest_no_fallback", False)):
         args.forest_action_shield = False
         args.forest_expert_exploration = False
-    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "cnn-sac", "cnn-td3", "cnn-td3-local")
+    canonical_all = ("mlp-dqn", "mlp-ddqn", "mlp-pddqn", "mlp-mdqn", "cnn-dqn", "cnn-ddqn", "cnn-pddqn", "cnn-mdqn", "cnn-sac", "cnn-td3", "cnn-td3-local", "cnn-dual-ddqn", "cnn-drqn", "cnn-histformer")
     raw_algos = [str(a).lower().strip() for a in (args.rl_algos or [])]
     if any(a == "all" for a in raw_algos):
         raw_algos = list(canonical_all[:-3])  # exclude cnn-sac, cnn-td3, cnn-td3-local from "all"
@@ -3968,7 +4123,7 @@ def main(argv: list[str] | None = None) -> int:
     rl_algos: list[str] = []
     unknown = []
     for a in raw_algos:
-        if a in ("cnn-sac", "cnn-td3", "cnn-td3-local"):
+        if a in ("cnn-sac", "cnn-td3", "cnn-td3-local", "cnn-dual-ddqn", "cnn-drqn", "cnn-histformer"):
             if a not in rl_algos:
                 rl_algos.append(a)
             continue
@@ -4128,6 +4283,7 @@ def main(argv: list[str] | None = None) -> int:
         "cnn-ddqn": ddqn_cfg,
         "cnn-pddqn": pddqn_cfg,
         "cnn-mdqn": mdqn_cfg,
+        "cnn-dual-ddqn": ddqn_cfg,
     }
     for algo in args.rl_algos:
         cfg = algo_cfgs.get(str(algo))
@@ -4153,6 +4309,9 @@ def main(argv: list[str] | None = None) -> int:
         "cnn-sac": "CNN-SAC",
         "cnn-td3": "CNN-TD3",
         "cnn-td3-local": "CNN-TD3-Local",
+        "cnn-dual-ddqn": "CNN-Dual-DDQN",
+        "cnn-drqn": "CNN-DRQN",
+        "cnn-histformer": "CNN-HistFormer",
     }
 
     for env_name in args.envs:
@@ -4196,7 +4355,7 @@ def main(argv: list[str] | None = None) -> int:
                 reward_potential_bias=float(getattr(args, "reward_potential_bias", 0.0)),
             )
             forest_demo_data = None
-            has_dqn_algos = any(str(a) not in ("cnn-sac", "cnn-td3", "cnn-td3-local") for a in args.rl_algos)
+            has_dqn_algos = any(str(a) not in ("cnn-sac", "cnn-td3", "cnn-td3-local", "cnn-drqn", "cnn-histformer") for a in args.rl_algos)
             if has_dqn_algos and bool(args.forest_demo_prefill) and int(args.learning_starts) > 0:
                 demo_target = forest_demo_target(
                     learning_starts=int(args.learning_starts),
@@ -4443,8 +4602,122 @@ def main(argv: list[str] | None = None) -> int:
                     f"elapsed={format_elapsed_s(time.perf_counter() - t_algo_start)}")
                 continue
 
+            # --- V36-A: DRQN ---
+            if str(algo) == "cnn-drqn":
+                if not isinstance(env, AMRBicycleEnv):
+                    print(f"cnn-drqn requires AMRBicycleEnv, got {type(env).__name__}", file=sys.stderr)
+                    return 2
+                try:
+                    _, algo_returns, algo_eval, algo_extra = train_one_drqn(
+                        env, episodes=args.episodes, config=agent_cfg,
+                        seed=args.seed, out_dir=out_dir,
+                        forest_reward_k_p=float(getattr(args, "forest_reward_k_p", 12.0)),
+                        forest_reward_k_len=float(getattr(args, "forest_reward_k_len", 0.10)),
+                        forest_adm_horizon=int(getattr(args, "forest_adm_horizon", 15)),
+                        forest_random_start_goal=bool(args.forest_random_start_goal),
+                        forest_rand_min_dist_m=float(args.forest_rand_min_dist_m),
+                        forest_rand_max_dist_m=rand_max,
+                        forest_rand_fixed_prob=float(args.forest_rand_fixed_prob),
+                        forest_rand_tries=int(args.forest_rand_tries),
+                        forest_rand_edge_margin_m=float(args.forest_rand_edge_margin_m),
+                        forest_train_two_suites=bool(getattr(args, "forest_train_two_suites", False)),
+                        forest_train_short_prob=float(getattr(args, "forest_train_short_prob", 0.5)),
+                        forest_train_short_min_dist_m=float(getattr(args, "forest_train_short_min_dist_m", 6.0)),
+                        forest_train_long_min_dist_m=float(getattr(args, "forest_train_long_min_dist_m", 42.0)),
+                        device=device, progress=progress,
+                    )
+                except Exception:
+                    import traceback; traceback.print_exc(); return 2
+                env_curves[str(algo)] = algo_returns
+                env_eval_rows[str(algo)] = list(algo_eval)
+                env_train_meta[str(algo)] = algo_extra.get("meta", {})
+                log(f"[train] Algo done: env={env_name}, algo={str(algo)}, elapsed={format_elapsed_s(time.perf_counter() - t_algo_start)}")
+                continue
+
+            # --- V36-C: HistFormer ---
+            if str(algo) == "cnn-histformer":
+                if not isinstance(env, AMRBicycleEnv):
+                    print(f"cnn-histformer requires AMRBicycleEnv, got {type(env).__name__}", file=sys.stderr)
+                    return 2
+                try:
+                    _, algo_returns, algo_eval, algo_extra = train_one_histformer(
+                        env, episodes=args.episodes, config=agent_cfg,
+                        seed=args.seed, out_dir=out_dir,
+                        forest_reward_k_p=float(getattr(args, "forest_reward_k_p", 12.0)),
+                        forest_reward_k_len=float(getattr(args, "forest_reward_k_len", 0.10)),
+                        forest_adm_horizon=int(getattr(args, "forest_adm_horizon", 15)),
+                        forest_random_start_goal=bool(args.forest_random_start_goal),
+                        forest_rand_min_dist_m=float(args.forest_rand_min_dist_m),
+                        forest_rand_max_dist_m=rand_max,
+                        forest_rand_fixed_prob=float(args.forest_rand_fixed_prob),
+                        forest_rand_tries=int(args.forest_rand_tries),
+                        forest_rand_edge_margin_m=float(args.forest_rand_edge_margin_m),
+                        forest_train_two_suites=bool(getattr(args, "forest_train_two_suites", False)),
+                        forest_train_short_prob=float(getattr(args, "forest_train_short_prob", 0.5)),
+                        forest_train_short_min_dist_m=float(getattr(args, "forest_train_short_min_dist_m", 6.0)),
+                        forest_train_long_min_dist_m=float(getattr(args, "forest_train_long_min_dist_m", 42.0)),
+                        device=device, progress=progress,
+                    )
+                except Exception:
+                    import traceback; traceback.print_exc(); return 2
+                env_curves[str(algo)] = algo_returns
+                env_eval_rows[str(algo)] = list(algo_eval)
+                env_train_meta[str(algo)] = algo_extra.get("meta", {})
+                log(f"[train] Algo done: env={env_name}, algo={str(algo)}, elapsed={format_elapsed_s(time.perf_counter() - t_algo_start)}")
+                continue
+
             # --- DQN family branch ---
             cfg = algo_cfgs[str(algo)]
+            # V36-B: cnn-dual-ddqn uses DualScaleWrapper (obs_dim 154→218)
+            _train_env = env
+            _train_demo_data = forest_demo_data
+            if str(algo) == "cnn-dual-ddqn" and isinstance(env, AMRBicycleEnv):
+                from forest_vehicle_dqn.env import DualScaleWrapper
+                _train_env = DualScaleWrapper(env)
+                # Re-collect demos with DualScaleWrapper so obs_dim=218 matches agent.
+                # collect_forest_demos uses env.reset()/step() which DualScaleWrapper
+                # overrides, and expert_action_*() calls are forwarded via __getattr__.
+                if bool(args.forest_demo_prefill) and int(args.learning_starts) > 0:
+                    _dual_target = forest_demo_target(
+                        learning_starts=int(args.learning_starts),
+                        batch_size=int(agent_cfg.batch_size),
+                        target_mult=float(args.forest_demo_target_mult),
+                        target_cap=int(args.forest_demo_target_cap),
+                    )
+                    log(f"[train] [{env_name}/cnn-dual-ddqn] Collecting 410-dim demos (target={_dual_target})...")
+                    _train_demo_data = collect_forest_demos(
+                        _train_env,
+                        target=_dual_target,
+                        seed=int(args.seed + 2000),
+                        forest_curriculum=bool(args.forest_curriculum),
+                        curriculum_band_m=float(args.curriculum_band_m),
+                        forest_random_start_goal=bool(args.forest_random_start_goal),
+                        forest_rand_min_dist_m=float(args.forest_rand_min_dist_m),
+                        forest_rand_max_dist_m=rand_max,
+                        forest_rand_fixed_prob=float(args.forest_rand_fixed_prob),
+                        forest_rand_tries=int(args.forest_rand_tries),
+                        forest_rand_edge_margin_m=float(args.forest_rand_edge_margin_m),
+                        forest_expert=str(args.forest_expert),
+                        forest_demo_horizon=int(args.forest_demo_horizon),
+                        forest_adm_horizon=int(args.forest_adm_horizon),
+                        forest_adm_persistence=int(args.forest_adm_persistence),
+                        forest_min_od_m=float(args.forest_min_od_m),
+                        forest_min_progress_m=float(args.forest_min_progress_m),
+                        forest_use_admissible_next_mask=(not bool(getattr(args, "forest_no_fallback", False))),
+                        forest_demo_w_clearance=float(args.forest_demo_w_clearance),
+                        mpc_cfg=mpc_cfg,
+                        astar_curve_cfg=astar_curve_cfg,
+                        astar_seed=int(args.seed + 2000),
+                        astar_timeout_s=float(astar_timeout_s),
+                        astar_max_expanded=int(astar_max_expanded),
+                        forest_demo_filter_min_progress_ratio=float(args.forest_demo_filter_min_progress_ratio),
+                        forest_demo_filter_min_progress_per_step_m=float(args.forest_demo_filter_min_progress_per_step_m),
+                        forest_demo_filter_max_steps=int(args.forest_demo_filter_max_steps),
+                        progress_write=progress_write,
+                    )
+                    log(f"[train] [{env_name}/cnn-dual-ddqn] 410-dim demo ready: size={int(_train_demo_data[0].shape[0])}")
+                else:
+                    _train_demo_data = None
             live_viewer = None
             if bool(getattr(args, "live_view", False)):
                 live_viewer = TrainLiveViewer(
@@ -4457,7 +4730,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             try:
                 _, algo_returns, algo_eval, algo_extra = train_one(
-                    env,
+                    _train_env,
                     str(algo),
                     episodes=args.episodes,
                     # Forest training (global-map + imitation warm-start) can be sensitive to random initialization.
@@ -4483,7 +4756,7 @@ def main(argv: list[str] | None = None) -> int:
                     forest_demo_pretrain_early_stop_patience=int(args.forest_demo_pretrain_early_stop_patience),
                     forest_demo_horizon=int(args.forest_demo_horizon),
                     forest_demo_w_clearance=float(args.forest_demo_w_clearance),
-                    forest_demo_data=forest_demo_data,
+                    forest_demo_data=_train_demo_data,
                     forest_expert=str(args.forest_expert),
                     forest_expert_exploration=bool(args.forest_expert_exploration),
                     forest_action_shield=bool(args.forest_action_shield),

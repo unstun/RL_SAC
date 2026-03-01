@@ -55,7 +55,7 @@
     "forest_mpc_w_pos": 6.0,
     "forest_mpc_w_yaw": 1.2,
     "forest_mpc_align_dist_m": 1.5,
-    "forest_mpc_collision_padding_m": 0.0,
+    "forest_mpc_collision_padding_m": 0.02,
     "forest_mpc_goal_lookahead_steps": 2,
     "forest_random_start_goal": true,
     "forest_curriculum": true,
